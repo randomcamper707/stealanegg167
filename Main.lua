@@ -1956,46 +1956,22 @@ local function physicalLayout(count,sizeValue,baseCF,bounds,pattern,footprintX,f
         cols=20
     end
     cols=math.min(cols,count)
-    local rows=math.ceil(count/math.max(cols,1))
 
-    -- Base spacing on the REAL visual footprint of the selected eggs. This gives
-    -- a small visible air gap even when the egg scale changes or a larger egg type
-    -- is mixed in, instead of guessing one spacing value for every model.
+    -- Never squeeze the actual egg footprints to fit a requested batch.
+    -- Use fewer columns/rows when larger eggs need more breathing room.
     local actualX=math.max(1,tonumber(footprintX) or (4*scale))
     local actualZ=math.max(1,tonumber(footprintZ) or (4*scale))
-    local gapX=math.max(1.15,.65*scale)
-    local gapZ=math.max(1.75,.9*scale)
-    local naturalX=math.max(7.25,actualX+gapX)
-    local naturalZ=math.max(9.0,actualZ+gapZ)
+    local sx=actualX+math.max(2,actualX*.30,1.1*scale)
+    local sz=actualZ+math.max(2.5,actualZ*.35,1.3*scale)
     local usableWidth=((bounds and bounds.X) or COMPACT_SPAWN_BOUNDS.X)*.985
     local usableDepth=((bounds and bounds.Z) or COMPACT_SPAWN_BOUNDS.Z)*.97
-
-    local sx=naturalX
-    local sz=naturalZ
-
-    if cols>1 then
-        local fitX=usableWidth/(cols-1)
-        if fitX<naturalX then
-            sx=fitX
-        else
-            sx=math.min(fitX,naturalX*1.12)
-        end
-    end
-
-    if rows>1 then
-        local fitZ=usableDepth/(rows-1)
-        if fitZ<naturalZ then
-            -- If a very large batch physically cannot keep the ideal gap,
-            -- fitting inside the non-safe play area wins over spilling into it.
-            sz=fitZ
-        else
-            -- Use more of the playable length, but cap expansion so row gaps
-            -- remain deliberate rather than huge.
-            sz=math.min(fitZ,naturalZ*1.55)
-        end
-    end
-
-    return cols,rows,sx,sz
+    local fitCols=usableWidth>=actualX and math.floor((usableWidth-actualX)/sx)+1 or 0
+    local fitRows=usableDepth>=actualZ and math.floor((usableDepth-actualZ)/sz)+1 or 0
+    cols=math.max(1,math.min(cols,fitCols))
+    local capacity=cols*fitRows
+    if fitCols==0 then capacity=0 end
+    local rows=math.ceil(math.min(count,capacity)/cols)
+    return cols,rows,sx,sz,capacity
 end
 local function layoutPosition(index,count,sizeValue,baseCF,bounds,pattern,footprintX,footprintZ)
     local cols,rows,sx,sz=physicalLayout(count,sizeValue,baseCF,bounds,pattern,footprintX,footprintZ)
@@ -2056,7 +2032,7 @@ local function eggPhysics(o,anchored)
     local function f(p) p.Anchored=anchored; p.CanCollide=false; p.CanTouch=false; p.CanQuery=true; p.Massless=not anchored end
     if o:IsA("BasePart") then f(o) else for _,p in ipairs(o:GetDescendants()) do if p:IsA("BasePart") then f(p) end end end
 end
-local function scaleEgg(o,v) local f=math.clamp(v,25,500)/100; if o:IsA("Model") then pcall(function() o:ScaleTo(f) end) else o.Size=o.Size*f end; return f end
+local function scaleEgg(o,v) local f=math.clamp(v,25,500)/100; if o:IsA("Model") then pcall(function() o:ScaleTo(o:GetScale()*f) end) else o.Size=o.Size*f end; return f end
 local function weldEgg(o)
     if not o:IsA("Model") then return end; local r=rootOf(o); if not r then return end
     for _,p in ipairs(o:GetDescendants()) do if p:IsA("BasePart") and p~=r and not p:FindFirstChild("SAE_Weld") then local w=Instance.new("WeldConstraint"); w.Name="SAE_Weld"; w.Part0=r; w.Part1=p; w.Parent=p end end
@@ -2179,7 +2155,7 @@ local function spawnEggs(name,count,size,pattern,customCF,batchTag)
     end
 
     count=math.clamp(tonumber(count) or 1,1,500)
-    size=math.clamp(tonumber(size) or 100,25,500)
+    size=math.clamp(tonumber(size) or 300,25,500)
     pattern=pattern or PATTERNS[1]
 
     -- Measure this batch before placing it. For MIXED we use the largest visual
@@ -2210,6 +2186,10 @@ local function spawnEggs(name,count,size,pattern,customCF,batchTag)
     if forward.Magnitude<.01 then forward=Vector3.new(0,0,-1) else forward=forward.Unit end
     baseCF=CFrame.lookAt(Vector3.new(baseCF.Position.X,baseY,baseCF.Position.Z),
         Vector3.new(baseCF.Position.X,baseY,baseCF.Position.Z)+forward)
+
+    local _,_,_,_,capacity=physicalLayout(count,size,baseCF,bounds,pattern,footprintX,footprintZ)
+    if capacity<1 then return false,"Not enough room for eggs at this scale. Choose a larger spawn area or lower the scale." end
+    count=math.min(count,capacity)
 
     local made=0
     local lastCols=0
@@ -3172,6 +3152,14 @@ local function clearBots()
     end
 end
 
+local function stopCollectors()
+    CollectorsEnabled=false
+    for _,d in ipairs(Bots) do
+        d.returning=true
+        d.returnStarted=nil
+    end
+end
+
 local function botBrain(d)
     task.spawn(function()
         local target=nil
@@ -3187,8 +3175,31 @@ local function botBrain(d)
             h.WalkSpeed=d.speed
             h.AutoRotate=true
 
-            if not CollectorsEnabled then
-                h:MoveTo(r.Position)
+            if d.returning or not CollectorsEnabled then
+                d.returning=true
+                if target and EggState[target] and EggState[target].claim==d.key then
+                    EggState[target].claim=nil
+                    EggState[target].claimTime=nil
+                end
+                target=nil
+                local home=d.home or safePosition() or r.Position
+                if not d.returnStarted then
+                    d.returnStarted=os.clock()
+                    d.returnTimeout=math.max(8,horizontalDistance(r.Position,home)/math.max(d.speed,1)+5)
+                end
+                h:MoveTo(home)
+                local arrived=horizontalDistance(r.Position,home)<=3.5 and math.abs(r.Position.Y-home.Y)<=8
+                if arrived or os.clock()-d.returnStarted>d.returnTimeout then
+                    -- A blocked bot still retires at home instead of remaining stuck.
+                    if not arrived then placeNPC(m,home,d.homeDirection or Vector3.new(0,0,-1)) end
+                    if carried and carried.Parent then dropEgg(carried,home,true) end
+                    carried=nil
+                    if d.trail then d.trail.Enabled=false end
+                    m:Destroy()
+                    local index=table.find(Bots,d)
+                    if index then table.remove(Bots,index) end
+                    break
+                end
             elseif carried and carried.Parent then
                 local sp=safePosition()
                 if sp then
@@ -3310,7 +3321,7 @@ local function spawnBots(n)
                 placeNPC(m,spawnPos,dir)
 
                 local trail=addTrail(m,tr)
-                local d={model=m,key="BOT_"..i.."_"..id[2],speed=speed,trail=trail,anim=animations(h)}
+                local d={model=m,key="BOT_"..i.."_"..id[2],speed=speed,trail=trail,anim=animations(h),home=r.Position,homeDirection=dir}
                 botTag(m,id,tr[1],stat)
                 table.insert(Bots,d)
                 botBrain(d)
@@ -3428,7 +3439,7 @@ end
 -- MAIN navigation and reference-style pages.
 local EggIndex=1
 local Amount=200
-local EggSize=100
+local EggSize=300
 local Pattern=PATTERNS[1]
 
 local Nav=Instance.new("Frame")
@@ -3601,7 +3612,7 @@ end
 amountButtons[200]:SetAttribute("RestingColor",C.purple)
 
 local sizeValue=function() return EggSize end
-sizeValue=intSlider(EggsPage,158,25,500,5,100,"Egg scale",function(v) EggSize=v end)
+sizeValue=intSlider(EggsPage,158,25,500,5,300,"Egg scale",function(v) EggSize=v end)
 local spawnBtn=button(EggsPage,"Spawn behind me",UDim2.fromOffset(4,210),UDim2.new(.5,-8,0,34),false)
 local clearEggBtn=button(EggsPage,"Clear eggs",UDim2.new(.5,4,0,210),UDim2.new(.5,-8,0,34),true)
 local spawnStatus=label(EggsPage,"Spawns eggs behind you, facing your direction.",UDim2.fromOffset(5,250),UDim2.new(1,-10,0,36),11)
@@ -3618,6 +3629,7 @@ spawnBtn.MouseButton1Click:Connect(function()
         local ok,made,cols,rows,fallbacks=spawnEggs(en,Amount,EggSize,Pattern,nil,"GENERAL")
         if ok then
             spawnStatus.Text=tostring(made).." eggs spawned: "..tostring(rows).." rows, "..tostring(cols).." per row."
+            if made<Amount then spawnStatus.Text=spawnStatus.Text.." Space fits "..tostring(made).." of "..tostring(Amount).." at this scale." end
             spawnStatus.TextColor3=C.green
             notice(P.UserId,Display,": spawned",tostring(made).." EGGS","")
         else
@@ -4072,9 +4084,9 @@ local clearNPCBtn=button(CollectorsPage,"Stop / clear NPCs",UDim2.fromOffset(0,2
 local collectorInfo=label(CollectorsPage,"Eggs: 0 | NPCs: 0",UDim2.fromOffset(5,326),UDim2.new(1,-16,0,28),9); collectorInfo.TextColor3=C.muted
 collectorsToggle.MouseButton1Click:Connect(function()
     if CollectorsEnabled then
-        CollectorsEnabled=false; collectorsToggle.Text="COLLECTORS: OFF"; collectorsToggle:SetAttribute("RestingColor",C.card2)
+        stopCollectors(); collectorInfo.Text="Collectors are returning home."; collectorInfo.TextColor3=C.muted; collectorsToggle.Text="COLLECTORS: OFF"; collectorsToggle:SetAttribute("RestingColor",C.card2)
     else
-        if arrlen(Bots)==0 then local ok,msg=spawnBots(NPCCount); if not ok then collectorInfo.Text=msg; collectorInfo.TextColor3=C.red; return end else CollectorsEnabled=true end
+        if arrlen(Bots)==0 or Bots[1].returning then local ok,msg=spawnBots(NPCCount); if not ok then collectorInfo.Text=msg; collectorInfo.TextColor3=C.red; return end else CollectorsEnabled=true end
         collectorsToggle.Text="COLLECTORS: ON"; collectorsToggle:SetAttribute("RestingColor",C.purple); collectorInfo.Text="Collectors bring eggs to the safe zone."; collectorInfo.TextColor3=C.green
     end
 end)
@@ -4089,7 +4101,7 @@ task.spawn(function()
             for _,b in ipairs(Bots) do if b.model and b.model.Parent then active=active+1 end end
             local eggs=0
             for e,st in pairs(EggState) do if e and e.Parent and not st.delivered then eggs=eggs+1 end end
-            if CollectorsEnabled then collectorInfo.Text="Eggs: "..eggs.." | NPCs: "..active.." | collecting" end
+            if CollectorsEnabled then collectorInfo.Text="Eggs: "..eggs.." | NPCs: "..active.." | collecting" else collectorInfo.Text=active>0 and ("NPCs returning: "..active) or "Collectors off. NPCs returned home." end
         end
     end
 end)
