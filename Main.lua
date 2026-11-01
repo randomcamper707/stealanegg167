@@ -918,7 +918,7 @@ CFG = {
     SammyUsername = "SpyderSammy",
     MaxBots = 10,
     Remotes = {
-        Morph=nil, Announcement=nil, GiveVPS=nil,
+        Morph=nil, Announcement=nil, GiveVPS=nil, Teleport=nil,
         GiveTreadmill=nil, GiveEggs=nil, GivePets=nil, GiveStars=nil, GiveEverything=nil,
         SpawnEggs=nil, SpawnSammy=nil, SpawnBots=nil,
         Boost=nil, ClearBoost=nil, Meteor=nil
@@ -3941,9 +3941,10 @@ end
 
 local botBrain
 local requestCollector
-local function createCollector(home,direction,slot,generation)
+local function createCollector(home,direction,slot,generation,arrivingModel,landingPosition)
     if generation~=CollectorGeneration or not CollectorsEnabled then return nil end
     local ok,m=pcall(function()
+        if arrivingModel then return arrivingModel end
         local ready=table.remove(CollectorReady,1)
         return ready or botAvatar(slot)
     end)
@@ -3959,14 +3960,19 @@ local function createCollector(home,direction,slot,generation)
     h.NameDisplayDistance=0;h.HealthDisplayDistance=0;h.AutoRotate=true
     r.Anchored=false
     local id=BOT_NAMES[((sequence-1)%arrlen(BOT_NAMES))+1]
+    if m:GetAttribute("CollectorUsername") then
+        id={m:GetAttribute("CollectorDisplayName") or m:GetAttribute("CollectorUsername"),m:GetAttribute("CollectorUsername")}
+    end
     local tr=TRAILS[math.random(1,arrlen(TRAILS))]
     local stat=math.random(200,270)*1000000
     local speed=72+((stat-200000000)/70000000)*22
     h.WalkSpeed=speed
     placeNPC(m,home,direction)
+    local returnHome=r.Position
+    if landingPosition then placeNPC(m,landingPosition,direction) end
     local trail=addTrail(m,tr)
     local d={model=m,key="BOT_"..sequence.."_"..id[2],slot=slot,generation=generation,
-        speed=speed,trail=trail,anim=animations(h),home=r.Position,homeDirection=direction}
+        speed=speed,trail=trail,anim=animations(h),home=returnHome,homeDirection=direction}
     if generation~=CollectorGeneration or not CollectorsEnabled then m:Destroy();return nil end
     botTag(m,id,tr[1],stat)
     table.insert(Bots,d)
@@ -4174,6 +4180,200 @@ local function spawnBots(n)
     CollectorsEnabled=true
     startCollectorStream(CollectorGeneration)
     return true,"Collectors running continuously."
+end
+
+-- A console teleport brings the requested avatar in as a local collector.
+-- Existing server teleport hooks remain optional through CFG.Remotes.Teleport.
+local TeleportArrivalBusy=false
+local function teleportCollector(account,onError)
+    if TeleportArrivalBusy then return false,"An arrival is already playing. Try again after it lands." end
+    local playerRoot=P.Character and P.Character:FindFirstChild("HumanoidRootPart")
+    if not playerRoot then return false,"Wait for your character to load." end
+    if not CollectorsEnabled then
+        local ok,message=spawnBots(2)
+        if not ok then return false,message end
+    end
+    local generation=CollectorGeneration
+    local direction=Vector3.new(playerRoot.CFrame.LookVector.X,0,playerRoot.CFrame.LookVector.Z)
+    if direction.Magnitude<.01 then direction=CollectorDirection else direction=direction.Unit end
+    local ground=nil
+    -- Prefer a clear spot just in front, with nearby alternatives near a wall.
+    for _,offset in ipairs({Vector3.new(0,0,-12),Vector3.new(7,0,-8),Vector3.new(-7,0,-8),Vector3.new(0,0,0)}) do
+        local candidate=(playerRoot.CFrame*CFrame.new(offset)).Position
+        local hit=groundHitNear(candidate,nil)
+        if hit and (not hit.Normal or hit.Normal.Y>.7)
+            and eggWallDistance(hit.Position,Vector3.new(1,0,0),4)>=3
+            and eggWallDistance(hit.Position,Vector3.new(-1,0,0),4)>=3
+            and eggWallDistance(hit.Position,Vector3.new(0,0,1),4)>=3
+            and eggWallDistance(hit.Position,Vector3.new(0,0,-1),4)>=3 then
+            ground=hit.Position;break
+        end
+    end
+    if not ground then return false,"No clear landing spot nearby. Move away from the wall and try again." end
+    TeleportArrivalBusy=true
+    task.spawn(function()
+        local model,effects=nil,nil
+        local temporary={}
+        local collisions={}
+        local camera=workspace.CurrentCamera
+        local savedCamera=nil
+        local cameraOwned=false
+        local cancelled=false
+        local imported=false
+        local function active()
+            return generation==CollectorGeneration and CollectorsEnabled and Gui.Parent~=nil
+        end
+        local function checkActive()
+            if not active() then cancelled=true;error("Arrival cancelled",0) end
+        end
+        local function part(name,size,cf,color,transparency,shape)
+            local p=Instance.new("Part")
+            p.Name=name;p.Size=size;p.CFrame=cf;p.Color=color
+            p.Anchored=true;p.CanCollide=false;p.CanTouch=false;p.CanQuery=false
+            p.Material=Enum.Material.Neon;p.Transparency=transparency or 0
+            p.CastShadow=false
+            if shape then p.Shape=shape end
+            p.Parent=effects
+            return p
+        end
+        local function segment(a,b,width,color,transparency)
+            return part("Lightning",Vector3.new(width,width,(b-a).Magnitude),CFrame.lookAt((a+b)/2,b),color,transparency)
+        end
+        local ok,err=xpcall(function()
+            model=createAvatar(account.id)
+            if not model then error("Could not load that avatar.",0) end
+            checkActive()
+            local h=model:FindFirstChildOfClass("Humanoid")
+            local r=model:FindFirstChild("HumanoidRootPart")
+            if not h or not r then error("That avatar has no usable character rig.",0) end
+            for _,node in ipairs(model:GetDescendants()) do
+                if node:IsA("Script") or node:IsA("LocalScript") or node:IsA("Tool") then
+                    node:Destroy()
+                elseif node:IsA("BasePart") then
+                    collisions[node]=node.CanCollide
+                    node.CanCollide=false
+                end
+            end
+            CollectorAvatarSerial=CollectorAvatarSerial+1
+            model.Name="Teleport arrival "..account.name
+            model:SetAttribute("CollectorAppearanceSequence",CollectorAvatarSerial)
+            model:SetAttribute("CollectorUsername",account.name)
+            model:SetAttribute("CollectorDisplayName",account.display)
+            model.PrimaryPart=r
+            h.DisplayDistanceType=Enum.HumanoidDisplayDistanceType.None
+            h.PlatformStand=true;h.AutoRotate=false;r.Anchored=true
+            local floorRoot=ground+Vector3.new(0,h.HipHeight+r.Size.Y/2,0)
+            model:PivotTo(CFrame.lookAt(floorRoot+Vector3.new(0,115,0),floorRoot+Vector3.new(0,115,0)+direction))
+            model.Parent=NPCFolder
+            effects=Instance.new("Folder");effects.Name="SAE_TeleportArrival";effects.Parent=workspace
+            local clouds={}
+            for i=1,7 do
+                local angle=i*math.pi*2/7
+                local cloud=part("StormCloud",Vector3.new(17,5,13),
+                    CFrame.new(ground+Vector3.new(math.cos(angle)*10,121+(i%3)*2,math.sin(angle)*7)),
+                    Color3.fromRGB(22,15,36),.15,Enum.PartType.Ball)
+                cloud.Material=Enum.Material.SmoothPlastic
+                table.insert(clouds,cloud)
+            end
+            local a=Instance.new("Attachment");a.Position=Vector3.new(-.9,.8,0);a.Parent=r
+            local b=Instance.new("Attachment");b.Position=Vector3.new(.9,.8,0);b.Parent=r
+            local trail=Instance.new("Trail");trail.Attachment0=a;trail.Attachment1=b
+            trail.Color=ColorSequence.new(Color3.fromRGB(193,143,255),Color3.fromRGB(245,235,255))
+            trail.Lifetime=.22;trail.FaceCamera=true;trail.Parent=r
+            table.insert(temporary,a);table.insert(temporary,b);table.insert(temporary,trail)
+            local flash=part("ImpactFlash",Vector3.new(1,1,1),CFrame.new(ground+Vector3.new(0,.3,0)),Color3.fromRGB(221,200,255),1,Enum.PartType.Ball)
+            local light=Instance.new("PointLight");light.Color=Color3.fromRGB(205,166,255);light.Range=45;light.Brightness=0;light.Parent=flash
+            local lightning={}
+            local function strike()
+                local last=ground+Vector3.new(0,140,0)
+                for i=1,13 do
+                    local point=i==13 and (ground+Vector3.new(0,.5,0))
+                        or (ground+Vector3.new(math.random(-7,7),140*(1-i/13),math.random(-5,5)))
+                    table.insert(lightning,segment(last,point,.65,Color3.fromRGB(147,77,255),.18))
+                    table.insert(lightning,segment(last,point,.18,Color3.fromRGB(252,245,255),0))
+                    if i==5 or i==9 then
+                        table.insert(lightning,segment(point,point+Vector3.new(10,-12,-6),.25,Color3.fromRGB(196,143,255),.1))
+                    end
+                    last=point
+                end
+                local soundService=game:GetService("SoundService")
+                local thunder=soundService:FindFirstChild("Thunder",true) or soundService:FindFirstChild("Lightning",true)
+                if thunder and thunder:IsA("Sound") and thunder.SoundId~="" then
+                    local sound=thunder:Clone();sound.Looped=false;sound.Parent=flash;sound:Play()
+                end
+            end
+            if camera and camera.CameraType~=Enum.CameraType.Scriptable then
+                savedCamera={cf=camera.CFrame,kind=camera.CameraType,subject=camera.CameraSubject,fov=camera.FieldOfView}
+                camera.CameraType=Enum.CameraType.Scriptable;cameraOwned=true
+            end
+            local right=Vector3.new(-direction.Z,0,direction.X)
+            local cameraPosition=ground-direction*34+right*13+Vector3.new(0,6,0)
+            local cameraTarget=ground+Vector3.new(0,4,0)
+            local cameraRay=RaycastParams.new()
+            cameraRay.FilterType=Enum.RaycastFilterType.Exclude
+            cameraRay.FilterDescendantsInstances={EggFolder,NPCFolder,P.Character,effects}
+            cameraRay.RespectCanCollide=true
+            local cameraHit=workspace:Raycast(cameraTarget,cameraPosition-cameraTarget,cameraRay)
+            if cameraHit then cameraPosition=cameraHit.Position+(cameraHit.Normal or Vector3.new(0,1,0))*2 end
+            local start=os.clock()
+            local struck=false
+            while true do
+                checkActive()
+                local t=os.clock()-start
+                if t>=2.8 then break end
+                local drop=math.clamp((t-.35)/1.15,0,1)
+                local y=115*(1-drop*drop)
+                model:PivotTo(CFrame.lookAt(floorRoot+Vector3.new(0,y,0),floorRoot+Vector3.new(0,y,0)+direction)
+                    *CFrame.Angles(math.rad(-12*(1-drop)),0,math.sin(drop*math.pi)*.1))
+                if t>=1.5 and not struck then struck=true;strike() end
+                if struck then
+                    local impact=t-1.5
+                    local pulse=math.clamp(impact/.7,0,1)
+                    flash.Size=Vector3.new(1+22*pulse,.3+1.5*(1-pulse),1+22*pulse)
+                    flash.Transparency=math.clamp(impact/.65,0,1)
+                    light.Brightness=math.max(0,8*(1-impact/.4))
+                    for _,bolt in ipairs(lightning) do bolt.Transparency=math.clamp((impact-.12)/.25,0,1) end
+                    for _,cloud in ipairs(clouds) do cloud.Transparency=math.clamp(.15+impact,0,1) end
+                end
+                if cameraOwned then
+                    local focus=floorRoot+Vector3.new(0,math.max(2,y*.85),0)
+                    camera.CFrame=CFrame.lookAt(cameraPosition,focus)
+                    camera.FieldOfView=60
+                end
+                RunService.RenderStepped:Wait()
+            end
+            checkActive()
+            for node,collide in pairs(collisions) do if node.Parent then node.CanCollide=collide end end
+            r.Anchored=false;h.PlatformStand=false;h.AutoRotate=true
+            for _,node in ipairs(temporary) do node:Destroy() end
+            temporary={}
+            local slot=((CollectorAvatarSerial-1)%CollectorSlots)+1
+            local collector=createCollector(CollectorOrigin,CollectorDirection,slot,generation,model,ground)
+            if not collector then error("Collector arrival was cancelled.",0) end
+            imported=true
+            pcall(function()
+                callRemote("Teleport",account.name)
+                notice(CFG.AnnouncementProfile.UserId,CFG.AnnouncementProfile.Name,"teleported",account.display,"",Enum.Font.FredokaOne)
+            end)
+        end,debug.traceback)
+        for _,node in ipairs(temporary) do pcall(function() node:Destroy() end) end
+        if not imported and model then pcall(function() model:Destroy() end) end
+        if effects then effects:Destroy() end
+        if cameraOwned and savedCamera and workspace.CurrentCamera==camera then
+            camera.CFrame=savedCamera.cf;camera.FieldOfView=savedCamera.fov
+            local subject=savedCamera.subject
+            if not subject or not subject.Parent then
+                subject=P.Character and P.Character:FindFirstChildOfClass("Humanoid")
+            end
+            camera.CameraSubject=subject;camera.CameraType=savedCamera.kind
+        end
+        TeleportArrivalBusy=false
+        if not ok and not cancelled then
+            warn("[SAE] Teleport arrival: "..tostring(err))
+            if onError then onError("Could not finish the teleport arrival. Try again.") end
+        end
+    end)
+    return true
 end
 
 -- Reference-script style boost/event controls. Without a configured legitimate server remote,
@@ -4908,6 +5108,8 @@ task.spawn(function()
     while Gui.Parent do
         task.wait(1)
         if collectorInfo and collectorInfo.Parent then
+            collectorsToggle.Text=CollectorsEnabled and "COLLECTORS: ON" or "COLLECTORS: OFF"
+            collectorsToggle:SetAttribute("RestingColor",CollectorsEnabled and C.purple or C.card2)
             local active=0
             for _,b in ipairs(Bots) do if b.model and b.model.Parent then active=active+1 end end
             local eggs=0
@@ -5060,7 +5262,7 @@ local function q(t)
     return b
 end
 local shortcuts={
-    "/announcements", "/givetreadmill", "/giveeggs", "/givepets", "/givestars", "/giveeverything", "/giveps"
+    "/announcements", "/teleport", "/givetreadmill", "/giveeggs", "/givepets", "/givestars", "/giveeverything", "/giveps"
 }
 local branchItems={
     ["/givepets"]={
@@ -5202,6 +5404,22 @@ local function command(raw)
         callRemote("Announcement",rest)
         notice(CFG.AnnouncementProfile.UserId,CFG.AnnouncementProfile.Name,":","",rest,Enum.Font.FredokaOne)
         line("Announcement shown.")
+        showCommands()
+        return
+    end
+    if cmd=="/teleport" then
+        if rest=="" then
+            clearChoices();quick.Visible=false;prefill("/teleport ")
+            line("Enter a Roblox username.",consoleMuted)
+            return
+        end
+        local account=resolveRecipient(rest,raw)
+        if not account then return end
+        local started,message=teleportCollector(account,function(problem)
+            if Console.Parent then Console.Visible=true;line(problem,C.red) end
+        end)
+        if not started then line(message,C.red);return end
+        Console.Visible=false
         showCommands()
         return
     end
