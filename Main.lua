@@ -2191,6 +2191,42 @@ task.spawn(function()
     end
 end)
 
+-- Probe through scenery to find the floor, rather than treating the first
+-- decorative hit (or a CanQuery-disabled floor) as a fatal placement error.
+function eggGroundHeight(pos,referenceY)
+    local rp=RaycastParams.new()
+    rp.FilterType=Enum.RaycastFilterType.Exclude
+    local excluded={EggFolder,NPCFolder}
+    if P.Character then table.insert(excluded,P.Character) end
+    for _=1,12 do
+        rp.FilterDescendantsInstances=excluded
+        local hit=workspace:Raycast(Vector3.new(pos.X,referenceY+12,pos.Z),Vector3.new(0,-80,0),rp)
+        if not hit then break end
+        local part=hit.Instance
+        local flat=not hit.Normal or hit.Normal.Y>=.85
+        local floorShape=not part or not part:IsA("BasePart") or
+            (part.Size.X>=12 and part.Size.Z>=12 and part.Size.Y<=18
+                and math.abs(part.CFrame.UpVector.Y)>=.8)
+        if flat and floorShape and math.abs(hit.Position.Y-referenceY)<=12 then return hit.Position.Y end
+        if not part then break end
+        table.insert(excluded,part)
+    end
+    -- Geometry remains usable even when the game's floor disables ray queries.
+    if MapFloor and MapFloor.Parent and MapFloor:IsA("BasePart") then
+        local normal=MapFloor.CFrame.UpVector
+        if math.abs(normal.Y)>=.8 then
+            local top=MapFloor.CFrame:PointToWorldSpace(Vector3.new(0,MapFloor.Size.Y/2,0))
+            local y=top.Y-((pos.X-top.X)*normal.X+(pos.Z-top.Z)*normal.Z)/normal.Y
+            local localPoint=MapFloor.CFrame:PointToObjectSpace(Vector3.new(pos.X,y,pos.Z))
+            if math.abs(localPoint.X)<=MapFloor.Size.X/2 and math.abs(localPoint.Z)<=MapFloor.Size.Z/2
+                and math.abs(y-referenceY)<=12 then return y end
+        end
+    end
+    -- The row positions already fit the measured map rectangle. An isolated
+    -- ray miss inside that rectangle must not cancel the entire selected batch.
+    return referenceY
+end
+
 local function spawnEggs(name,count,size,pattern,customCF,batchTag)
     local mix=nil
     if name=="MIXED" then
@@ -2228,8 +2264,7 @@ local function spawnEggs(name,count,size,pattern,customCF,batchTag)
     local footprintZ=baseFootZ*visualScale
 
     local baseCF,bounds=visibleSpawnFrame(customCF,count,pattern,size)
-    local centerHit=groundHitNear(baseCF.Position,nil)
-    local baseY=centerHit and centerHit.Position.Y or baseCF.Position.Y
+    local baseY=eggGroundHeight(baseCF.Position,baseCF.Position.Y)
     local forward=Vector3.new(baseCF.LookVector.X,0,baseCF.LookVector.Z)
     if forward.Magnitude<.01 then forward=Vector3.new(0,0,-1) else forward=forward.Unit end
     baseCF=CFrame.lookAt(Vector3.new(baseCF.Position.X,baseY,baseCF.Position.Z),
@@ -2254,20 +2289,9 @@ local function spawnEggs(name,count,size,pattern,customCF,batchTag)
     end
 
     local groundHeights={}
-    -- Check the centre and four footprint corners before cloning anything.
-    -- Missing ground/walls must not silently become floating eggs at baseY.
     for i=1,count do
         local wanted=layoutPosition(i,count,size,baseCF,bounds,pattern,footprintX,footprintZ)
-        for _,offset in ipairs({Vector3.new(),Vector3.new(-footprintX/2,0,-footprintZ/2),
-            Vector3.new(footprintX/2,0,-footprintZ/2),Vector3.new(-footprintX/2,0,footprintZ/2),
-            Vector3.new(footprintX/2,0,footprintZ/2)}) do
-            local probe=wanted+baseCF.RightVector*offset.X-baseCF.LookVector*offset.Z
-            local hit=playableGroundHit(probe,baseY)
-            if hit and offset.X==0 and offset.Z==0 then groundHeights[i]=hit.Position.Y end
-            if not hit or math.abs(hit.Position.Y-baseY)>4 or (hit.Normal and hit.Normal.Y<.7) then
-                return false,"The egg grid crosses a wall or missing floor. Move to a clear part of the map and try again."
-            end
-        end
+        groundHeights[i]=eggGroundHeight(wanted,baseY)
         if i%25==0 then task.wait() end
     end
 
