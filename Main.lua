@@ -4286,22 +4286,24 @@ local function teleportCollector(account,onError)
                 end
             end
             local function pose(crouch,lookUp)
-                local lean=r15 and 46 or 50
+                -- Pose 1: left palm and left knee down, right foot forward, right arm back.
+                local lean=r15 and 27 or 32
                 if r15 then jointPose("waist",-lean*crouch,0,0)
                 else jointPose("rootjoint",-lean*crouch,0,0) end
-                jointPose("neck",(lean+23)*lookUp,0,0)
-                jointPose("leftshoulder",(r15 and 48 or 70)*crouch,0,-15*crouch)
-                jointPose("rightshoulder",(r15 and 48 or 70)*crouch,0,15*crouch)
+                jointPose("neck",lean*lookUp,0,0)
+                jointPose("leftshoulder",(r15 and 48 or 70)*crouch,0,-18*crouch)
+                jointPose("rightshoulder",-48*crouch,-15*crouch,32*crouch)
+                jointPose("rightelbow",-45*crouch,0,0)
                 if r15 then
-                    jointPose("lefthip",65*crouch,0,-8*crouch)
-                    jointPose("righthip",65*crouch,0,8*crouch)
-                    jointPose("leftknee",-110*crouch,0,0)
-                    jointPose("rightknee",-110*crouch,0,0)
-                    jointPose("leftankle",45*crouch,0,0)
-                    jointPose("rightankle",45*crouch,0,0)
+                    jointPose("lefthip",30*crouch,0,-12*crouch)
+                    jointPose("righthip",95*crouch,0,16*crouch)
+                    jointPose("leftknee",-120*crouch,0,0)
+                    jointPose("rightknee",-95*crouch,0,0)
+                    jointPose("leftankle",65*crouch,0,0)
+                    jointPose("rightankle",0,0,0)
                 else
-                    jointPose("lefthip",-20*crouch,0,-12*crouch)
-                    jointPose("righthip",-20*crouch,0,12*crouch)
+                    jointPose("lefthip",-65*crouch,0,-12*crouch)
+                    jointPose("righthip",65*crouch,0,16*crouch)
                 end
             end
             CollectorAvatarSerial=CollectorAvatarSerial+1
@@ -4354,26 +4356,31 @@ local function teleportCollector(account,onError)
             local contacts={}
             local torso=model:FindFirstChild("UpperTorso") or model:FindFirstChild("Torso") or r
             local poseScale=math.clamp(torso.Size.X/2,.65,1.6)
-            local function contact(name,upperName,endName,x,z,poleX,poleZ)
+            local function contact(name,upperName,endName,x,z,poleX,poleZ,knee)
                 local upper=model:FindFirstChild(upperName)
                 local endpoint=model:FindFirstChild(endName)
                 if not upper or not endpoint then return end
                 local target=Instance.new("Attachment")
-                target.Name=name.."Contact";target.Position=Vector3.new(x*poseScale,endpoint.Size.Y/2+.04,z*poseScale)
+                target.Name=name.."Contact"
+                local contactHeight=(knee or name=="LeftHand") and endpoint.Size.Z/2+.04 or endpoint.Size.Y/2+.04
+                target.Position=Vector3.new(x*poseScale,contactHeight,z*poseScale)
                 target.Parent=landingAnchor
                 local pole=Instance.new("Attachment")
                 pole.Name=name.."Pole";pole.Position=Vector3.new(poleX*poseScale,1,poleZ*poseScale);pole.Parent=landingAnchor
                 local ik=Instance.new("IKControl")
-                ik.Name=name.."LandingIK";ik.Type=Enum.IKControlType.Position
+                ik.Name=name.."LandingIK"
+                ik.Type=knee and Enum.IKControlType.Position or Enum.IKControlType.Transform
                 ik.ChainRoot=upper;ik.EndEffector=endpoint;ik.Target=target;ik.Pole=pole
+                -- Position the knee joint itself at floor level, not the shin center.
+                if knee then ik.EndEffectorOffset=CFrame.new(0,endpoint.Size.Y/2,0)
+                elseif name=="LeftHand" then ik.EndEffectorOffset=CFrame.Angles(math.pi/2,0,0) end
                 ik.Weight=0;ik.SmoothTime=.04;ik.Priority=100;ik.Enabled=true;ik.Parent=h
                 table.insert(contacts,ik);table.insert(temporary,ik)
             end
             if r15 then
-                contact("LeftHand","LeftUpperArm","LeftHand",-1.1,-1.65,-2.3,-.7)
-                contact("RightHand","RightUpperArm","RightHand",1.1,-1.65,2.3,-.7)
-                contact("LeftFoot","LeftUpperLeg","LeftFoot",-.85,.9,-1,-1.8)
-                contact("RightFoot","RightUpperLeg","RightFoot",.85,.9,1,-1.8)
+                contact("LeftHand","LeftUpperArm","LeftHand",-1.25,-1.25,-2.3,-.7)
+                contact("LeftKnee","LeftUpperLeg","LeftLowerLeg",-.7,.35,-.9,-1.2,true)
+                contact("RightFoot","RightUpperLeg","RightFoot",1,-1.2,1.2,-2.1)
             end
             local a=Instance.new("Attachment");a.Position=Vector3.new(-.9,.8,0);a.Parent=r
             local b=Instance.new("Attachment");b.Position=Vector3.new(.9,.8,0);b.Parent=r
@@ -4418,7 +4425,7 @@ local function teleportCollector(account,onError)
             if cameraHit then cameraPosition=cameraHit.Position+(cameraHit.Normal or Vector3.new(0,1,0))*2 end
             local start=os.clock()
             local struck=false
-            local crouchHeight=math.clamp(standingHeight*.48,.95,2.1)
+            local crouchHeight=math.clamp(standingHeight*.52,1.1,2.2)
             local radius=math.clamp(8*poseScale,6.5,12)
             while true do
                 checkActive()
@@ -4451,13 +4458,18 @@ local function teleportCollector(account,onError)
                 end
                 if cameraOwned then
                     local zoom=smooth((t-1.5)/.9)
-                    local orbit=smooth((t-3)/2.7)*math.pi*2
+                    local orbit=smooth((t-3.4)/2.3)*math.pi*2
                     local retreat=smooth((t-5.7)/.65)
-                    local closePosition=ground+(direction*math.cos(orbit)+right*math.sin(orbit))*(radius+3*retreat)
+                    local orbitPosition=ground+(direction*math.cos(orbit)+right*math.sin(orbit))*(radius+3*retreat)
                         +Vector3.new(0,2.5*poseScale+retreat,0)
                     local head=model:FindFirstChild("Head")
-                    local closeFocus=ground+Vector3.new(0,1.9*poseScale+retreat,0)
-                    if t<3 and head then closeFocus=head.Position end
+                    local faceFocus=head and head.Position or ground+Vector3.new(0,2.4*poseScale,0)
+                    -- Hold a front three-quarter close-up before widening into the orbit.
+                    local faceDistance=math.clamp((head and head.Size.X or 2)*2.6,4.5,8)
+                    local facePosition=faceFocus+direction*faceDistance+right*(.65*poseScale)+Vector3.new(0,.15*poseScale,0)
+                    local widen=smooth((t-3.05)/.55)
+                    local closePosition=facePosition:Lerp(orbitPosition,widen)
+                    local closeFocus=faceFocus:Lerp(ground+Vector3.new(0,1.9*poseScale+retreat,0),widen)
                     local focus=(floorRoot+Vector3.new(0,math.max(2,y*.85),0)):Lerp(closeFocus,zoom)
                     local desired=cameraPosition:Lerp(closePosition,zoom)
                     local impact=math.max(0,t-1.5)
@@ -4466,7 +4478,7 @@ local function teleportCollector(account,onError)
                     local hit=workspace:Raycast(focus,desired-focus,cameraRay)
                     if hit then desired=hit.Position+(hit.Normal or Vector3.new(0,1,0))*.7 end
                     camera.CFrame=CFrame.lookAt(desired,focus)
-                    camera.FieldOfView=60-16*zoom+9*smooth((t-3)/.3)+5*retreat
+                    camera.FieldOfView=60-22*zoom+15*smooth((t-3.05)/.55)+5*retreat
                 end
                 RunService.RenderStepped:Wait()
             end
