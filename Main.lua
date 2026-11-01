@@ -1445,7 +1445,7 @@ function templateInfo(name)
         return nil
     end
 
-    local info={template=clone,bottomOffset=0,size=Vector3.new(4,4,4)}
+    local info={template=clone,bottomOffset=0,centerOffset=Vector3.new(),size=Vector3.new(4,4,4)}
     if clone:IsA("Model") then
         pcall(function() clone:PivotTo(CFrame.new()) end)
         local okBox,cf,sz=pcall(function()
@@ -1456,6 +1456,7 @@ function templateInfo(name)
             pcall(function() clone:Destroy() end)
             return nil
         end
+        info.centerOffset=Vector3.new(cf.Position.X,0,cf.Position.Z)
         info.bottomOffset=cf.Position.Y-sz.Y/2
         info.size=sz
     else
@@ -1719,7 +1720,7 @@ function findPlayableSpawnFrame()
     }
 
     local startDistance=safeClearanceRadius()
-    local maxDistance=340
+    local maxDistance=4096
     local step=8
     local best=nil
 
@@ -1731,6 +1732,7 @@ function findPlayableSpawnFrame()
         local floorVotes={}
 
         for d=startDistance,maxDistance,step do
+            if (d-startDistance)%(step*32)==0 then task.wait() end
             local probe=root.Position+dir*d
             local hit=playableGroundHit(Vector3.new(probe.X,root.Position.Y,probe.Z),groundY)
             if hit then
@@ -1792,6 +1794,7 @@ function findPlayableSpawnFrame()
     local last=nil
     local misses=0
     for d=startDistance,maxDistance,step do
+        if (d-startDistance)%(step*32)==0 then task.wait() end
         local probe=root.Position+dir*d
         local hit=playableGroundHit(Vector3.new(probe.X,root.Position.Y,probe.Z),groundY)
         if hit then
@@ -1957,15 +1960,20 @@ local function physicalLayout(count,sizeValue,baseCF,bounds,pattern,footprintX,f
     end
     cols=math.min(cols,count)
 
-    -- Quantity and pattern define the grid. A detected patch of floor must
-    -- never reduce a requested 200/500-egg batch to a handful of eggs.
-    -- Use the measured scaled footprint plus a small, consistent air gap.
-    local actualX=math.max(1,tonumber(footprintX) or (4*scale))
-    local actualZ=math.max(1,tonumber(footprintZ) or (4*scale))
+    -- Fit columns inside the walls, then put the remaining eggs down the
+    -- long axis. Never replace the selected count with an area capacity.
+    local actualX=math.max(.1,tonumber(footprintX) or (4*scale))
+    local actualZ=math.max(.1,tonumber(footprintZ) or (4*scale))
     local sx=actualX+math.max(1.25,actualX*.08,.45*scale)
     local sz=actualZ+math.max(1.5,actualZ*.08,.55*scale)
+    local width=math.max(0,((bounds and bounds.X) or COMPACT_SPAWN_BOUNDS.X)-4)
+    local depth=math.max(0,((bounds and bounds.Z) or COMPACT_SPAWN_BOUNDS.Z)-4)
+    local fitCols=width>=actualX and math.floor((width-actualX)/sx)+1 or 0
+    local lengthwiseCols=math.max(1,math.floor(math.sqrt(count*width/math.max(depth,1))))
+    cols=math.max(1,math.min(cols,fitCols,lengthwiseCols))
     local rows=math.ceil(count/cols)
-    return cols,rows,sx,sz
+    local fits=fitCols>0 and ((rows-1)*sz+actualZ)<=depth
+    return cols,rows,sx,sz,fits
 end
 local function layoutPosition(index,count,sizeValue,baseCF,bounds,pattern,footprintX,footprintZ)
     local cols,rows,sx,sz=physicalLayout(count,sizeValue,baseCF,bounds,pattern,footprintX,footprintZ)
@@ -2181,13 +2189,39 @@ local function spawnEggs(name,count,size,pattern,customCF,batchTag)
     baseCF=CFrame.lookAt(Vector3.new(baseCF.Position.X,baseY,baseCF.Position.Z),
         Vector3.new(baseCF.Position.X,baseY,baseCF.Position.Z)+forward)
 
-    -- Grow the field away from its near edge as more rows are needed. This
-    -- preserves the Safe Zone buffer instead of centering extra rows over it.
-    local _,fieldRows,_,rowSpacing=physicalLayout(count,size,baseCF,bounds,pattern,footprintX,footprintZ)
-    local fieldDepth=(fieldRows-1)*rowSpacing+footprintZ
-    local detectedDepth=(bounds and bounds.Z) or COMPACT_SPAWN_BOUNDS.Z
-    local extraDepth=math.max(0,fieldDepth-detectedDepth)
-    baseCF=baseCF*CFrame.new(0,0,-extraDepth/2)
+    -- Keep every egg inside the measured region. If necessary, reduce the
+    -- effective scale, never the quantity or the gaps.
+    local function fitsAt(value)
+        return select(5,physicalLayout(count,value,baseCF,bounds,pattern,baseFootX*value/100,baseFootZ*value/100))
+    end
+    if not fitsAt(size) then
+        if not fitsAt(25) then return false,"The selected quantity cannot fit on this floor, even at scale 25. Choose a longer clear area." end
+        local lo,hi=25,size
+        for _=1,16 do
+            local mid=(lo+hi)/2
+            if fitsAt(mid) then lo=mid else hi=mid end
+        end
+        size=math.floor(lo*10)/10
+        visualScale=size/100
+        footprintX=baseFootX*visualScale
+        footprintZ=baseFootZ*visualScale
+    end
+
+    -- Check the centre and four footprint corners before cloning anything.
+    -- Missing ground/walls must not silently become floating eggs at baseY.
+    for i=1,count do
+        local wanted=layoutPosition(i,count,size,baseCF,bounds,pattern,footprintX,footprintZ)
+        for _,offset in ipairs({Vector3.new(),Vector3.new(-footprintX/2,0,-footprintZ/2),
+            Vector3.new(footprintX/2,0,-footprintZ/2),Vector3.new(-footprintX/2,0,footprintZ/2),
+            Vector3.new(footprintX/2,0,footprintZ/2)}) do
+            local probe=wanted+baseCF.RightVector*offset.X-baseCF.LookVector*offset.Z
+            local hit=playableGroundHit(probe,baseY)
+            if not hit or math.abs(hit.Position.Y-baseY)>4 or (hit.Normal and hit.Normal.Y<.7) then
+                return false,"The egg grid crosses a wall or missing floor. Move to a clear part of the map and try again."
+            end
+        end
+        if i%25==0 then task.wait() end
+    end
 
     local made=0
     local lastCols=0
@@ -2213,7 +2247,8 @@ local function spawnEggs(name,count,size,pattern,customCF,batchTag)
                 eggPhysics(egg,true)
 
                 local y=baseY-(info.bottomOffset*scale)+.08
-                local cf=CFrame.new(wanted.X,y,wanted.Z)
+                local offset=info.centerOffset or Vector3.new()
+                local cf=CFrame.new(wanted.X-offset.X*scale,y,wanted.Z-offset.Z*scale)
                 pivot(egg,cf)
 
                 registerEgg(egg,en,scale)
@@ -2227,7 +2262,7 @@ local function spawnEggs(name,count,size,pattern,customCF,batchTag)
     if made<=0 then
         return false,"The game egg visuals were found, but none could be cloned."
     end
-    return true,made,lastCols,lastRows,0
+    return true,made,lastCols,lastRows,0,size
 end
 
 local function clearSpawnedEggs(batchTag)
@@ -3624,9 +3659,10 @@ spawnBtn.MouseButton1Click:Connect(function()
         spawnStatus.Text="Server spawn request sent."
         spawnStatus.TextColor3=C.green
     else
-        local ok,made,cols,rows,fallbacks=spawnEggs(en,Amount,EggSize,Pattern,nil,"GENERAL")
+        local ok,made,cols,rows,fallbacks,appliedScale=spawnEggs(en,Amount,EggSize,Pattern,nil,"GENERAL")
         if ok then
             spawnStatus.Text=tostring(made).." eggs spawned: "..tostring(rows).." rows, "..tostring(cols).." per row."
+            if appliedScale and appliedScale<EggSize then spawnStatus.Text=spawnStatus.Text.." Scale fitted to "..tostring(appliedScale).." to stay inside the map." end
             spawnStatus.TextColor3=C.green
             notice(P.UserId,Display,": spawned",tostring(made).." EGGS","")
         else
