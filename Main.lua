@@ -1303,44 +1303,40 @@ function matchObj(o,want)
     return false
 end
 
-function usableEggSource(o,container)
-    if not o or o==EggFolder or o==NPCFolder then return nil end
-    if o:IsDescendantOf(EggFolder) or o:IsDescendantOf(NPCFolder) then return nil end
+function eggAssetCollection(o)
+    local n=norm(o.Name)
+    return n=="eggs" or n=="eggmodels" or n=="eggassets" or n=="eggtemplates"
+        or n=="eggspawns" or n=="spawneggs" or n=="spawnedeggs" or n=="eggvisuals"
+end
 
-    if o:IsA("Model") and o:FindFirstChildWhichIsA("BasePart",true) then return o end
-    if o:IsA("BasePart") then
-        local model=o:FindFirstAncestorOfClass("Model")
-        if model and model~=P.Character and model:IsDescendantOf(container)
-            and model:FindFirstChildWhichIsA("BasePart",true) then
-            return model
+function eggSpeciesName(value)
+    if not EggSpeciesNames then
+        EggSpeciesNames={}
+        for name,aliases in pairs(ALIAS) do
+            EggSpeciesNames[norm(name)]=true
+            for _,alias in ipairs(aliases) do EggSpeciesNames[norm(alias)]=true end
         end
-        return o
     end
+    return EggSpeciesNames[norm(value)]==true
+end
 
-    if o:IsA("Folder") or o:IsA("Tool") then
-        local model=o:FindFirstChildWhichIsA("Model",true)
-        if model and model:FindFirstChildWhichIsA("BasePart",true) then return model end
-        return o:FindFirstChildWhichIsA("BasePart",true)
-    end
-
-    local cur=o.Parent
-    while cur and cur~=container do
-        if cur:IsA("Model") and cur~=P.Character and cur:FindFirstChildWhichIsA("BasePart",true) then
-            return cur
-        elseif cur:IsA("Tool") then
-            local handle=cur:FindFirstChildWhichIsA("BasePart",true)
-            if handle then return handle end
+function usableEggSource(o,container)
+    if not o or o==EggFolder or o==NPCFolder
+        or o:IsDescendantOf(EggFolder) or o:IsDescendantOf(NPCFolder) then return nil end
+    local source=nil
+    local cur=o
+    while cur and cur~=container and not eggAssetCollection(cur) do
+        local assembly=cur:IsA("Model") or cur:IsA("Folder") or cur:IsA("Tool")
+        local visual=cur:IsA("BasePart") or (assembly and cur:FindFirstChildWhichIsA("BasePart",true))
+        if visual then
+            -- Preserve the complete species assembly, including sibling meshes.
+            -- A nested shell/nest/FX model is never its own egg type.
+            if not source or norm(cur.Name):find("egg",1,true) or cur:GetAttribute("EggName")
+                or eggSpeciesName(cur.Name) then source=cur end
         end
         cur=cur.Parent
     end
-
-    if o:IsA("Folder") or o:IsA("Tool") then
-        local model=o:FindFirstChildWhichIsA("Model",true)
-        if model and model:FindFirstChildWhichIsA("BasePart",true) then return model end
-        local part=o:FindFirstChildWhichIsA("BasePart",true)
-        if part then return part end
-    end
-    return nil
+    return source
 end
 
 -- Require egg identity as well as the species name. Pet aliases overlap the
@@ -1396,7 +1392,7 @@ function findEgg(name)
 end
 
 -- Build a stripped visual template from the REAL egg object already replicated by the game.
--- Scripts, sounds, particles and interaction objects are removed once so large batches
+-- Scripts, sounds and interaction objects are removed once so large batches
 -- can keep the original mesh/texture/decal appearance without cloning the heavy behavior.
 EggTemplateCache={}
 
@@ -1406,8 +1402,7 @@ function stripEggTemplate(o)
         if x:IsA("Script") or x:IsA("LocalScript") or x:IsA("ModuleScript")
             or x:IsA("ProximityPrompt") or x:IsA("ClickDetector")
             or x:IsA("Humanoid") or x:IsA("Animator")
-            or x:IsA("Sound") or x:IsA("ParticleEmitter")
-            or x:IsA("Trail") or x:IsA("Beam")
+            or x:IsA("Sound")
             or x:IsA("BodyMover") or x:IsA("Constraint") then
             table.insert(remove,x)
         elseif x:IsA("BasePart") then
@@ -1443,6 +1438,31 @@ function eggVisualBounds(o)
     return CFrame.new((low+high)/2),high-low
 end
 
+-- Some source assemblies mark visible descendants non-archivable. Temporarily
+-- include those parts while cloning, then restore every source flag immediately.
+function cloneWholeEgg(source)
+    local changed={}
+    local nodes={source}
+    for _,node in ipairs(source:GetDescendants()) do table.insert(nodes,node) end
+    for _,node in ipairs(nodes) do
+        if node.Archivable==false then
+            table.insert(changed,node)
+            node.Archivable=true
+        end
+    end
+    local ok,clone=pcall(function() return source:Clone() end)
+    for _,node in ipairs(changed) do node.Archivable=false end
+    if not ok or not clone then return nil end
+    if clone:IsA("Folder") or clone:IsA("Tool") then
+        local model=Instance.new("Model")
+        model.Name=clone.Name
+        for _,child in ipairs(clone:GetChildren()) do child.Parent=model end
+        clone:Destroy()
+        clone=model
+    end
+    return clone
+end
+
 function templateInfo(name)
     local cached=EggTemplateCache[name]
     if cached then return cached end
@@ -1452,10 +1472,8 @@ function templateInfo(name)
         return nil
     end
 
-    local ok,clone=pcall(function() return source:Clone() end)
-    if not ok or not clone then
-        return nil
-    end
+    local clone=cloneWholeEgg(source)
+    if not clone then return nil end
 
     clone.Name=name
     stripEggTemplate(clone)
@@ -1504,18 +1522,20 @@ function availableEggs()
         end
     end
     for i=2,arrlen(EGGS) do add(EGGS[i],findEgg(EGGS[i])) end
-    -- Include current game eggs absent from the older hardcoded catalog.
-    -- Only accept actual egg assets; never fill missing species with pets.
     for _,container in ipairs({ReplicatedStorage,workspace}) do
         for _,o in ipairs(container:GetDescendants()) do
-            if o:IsA("Model") or (o:IsA("BasePart") and not o:FindFirstAncestorOfClass("Model")) then
-                local n=norm(o.Name)
-                if n~="egg" and n~="eggs" and n~="eggmodels" and n~="eggassets" and n~="eggtemplates" and #n>3 and eggSourceScore(o,container)
-                    and (o:IsA("BasePart") or o:FindFirstChildWhichIsA("BasePart",true)) and not seen[o] then
-                    local name=o.Name
-                    if not EggCache[name] or EggCache[name]==o then
-                        EggCache[name]=o
-                        add(name,o)
+            if o:IsA("Model") or o:IsA("Folder") or o:IsA("Tool") or o:IsA("BasePart") then
+                local source=usableEggSource(o,container)
+                if source and not seen[source] and eggSourceScore(source,container) then
+                    local name=source:GetAttribute("EggName") or source.Name
+                    local n=norm(name)
+                    -- Discover whole named eggs, not generic nests, shells or effects.
+                    if n~="egg" and n~="eggs" and n~="eggshell" and n~="eggnest" and n~="eggbase"
+                        and n~="eggfx" and n~="eggvfx" and n~="eggstand" and n~="eggpart"
+                        and n:find("egg",1,true) and not eggAssetCollection(source)
+                        and (not EggCache[name] or EggCache[name]==source) then
+                        EggCache[name]=source
+                        add(name,source)
                     end
                 end
             end
@@ -2006,7 +2026,7 @@ local function physicalLayout(count,sizeValue,baseCF,bounds,pattern,footprintX,f
     local actualX=math.max(.1,tonumber(footprintX) or (4*scale))
     local actualZ=math.max(.1,tonumber(footprintZ) or (4*scale))
     local sx=actualX+math.max(.2,actualX*.02,.06*scale)
-    local sz=actualZ+math.max(.25,actualZ*.02,.075*scale)
+    local sz=actualZ+math.max(.125,actualZ*.01,.0375*scale)
     local width=math.max(0,((bounds and bounds.X) or COMPACT_SPAWN_BOUNDS.X)-4)
     local depth=math.max(0,((bounds and bounds.Z) or COMPACT_SPAWN_BOUNDS.Z)-4)
     local fitCols=width>=actualX and math.floor((width-actualX)/sx)+1 or 0
@@ -2232,6 +2252,7 @@ local function spawnEggs(name,count,size,pattern,customCF,batchTag)
     local mix=nil
     if name=="MIXED" then
         mix=availableEggs()
+        print("[Egg spawner] Mixed egg names: "..table.concat(mix,", "))
         if arrlen(mix)==0 then
             return false,"None of the configured egg visuals are replicated to this client."
         end
