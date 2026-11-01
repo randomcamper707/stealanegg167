@@ -2010,7 +2010,7 @@ local function physicalLayout(count,sizeValue,baseCF,bounds,pattern,footprintX,f
     local width=math.max(0,((bounds and bounds.X) or COMPACT_SPAWN_BOUNDS.X)-4)
     local depth=math.max(0,((bounds and bounds.Z) or COMPACT_SPAWN_BOUNDS.Z)-4)
     local fitCols=width>=actualX and math.floor((width-actualX)/sx)+1 or 0
-    local minCols=math.min(count,6)
+    local minCols=math.min(count,3)
     cols=math.max(minCols,math.min(cols,fitCols))
     local rows=math.ceil(count/cols)
     local fits=fitCols>=cols and ((rows-1)*sz+actualZ)<=depth
@@ -2075,10 +2075,10 @@ local function eggPhysics(o,anchored)
     if o:IsA("BasePart") then f(o) else for _,p in ipairs(o:GetDescendants()) do if p:IsA("BasePart") then f(p) end end end
 end
 local function scaleEgg(o,v,nativeSize)
-    local nativeSpan=nativeSize and math.max(nativeSize.X,nativeSize.Y,nativeSize.Z) or 5
-    -- Scale 300 means a visible 15-stud egg, regardless of the source model's
+    local nativeSpan=nativeSize and math.max(nativeSize.X,nativeSize.Y,nativeSize.Z) or 10
+    -- Scale 300 means a visible 30-stud egg, regardless of the source model's
     -- native units. A huge source must not make every other species miniature.
-    local f=(math.clamp(v,25,500)/100)*5/math.max(nativeSpan,.01)
+    local f=(math.clamp(v,25,500)/100)*10/math.max(nativeSpan,.01)
     if o:IsA("Model") then o:ScaleTo(o:GetScale()*f) else o.Size=o.Size*f end
     return f
 end
@@ -2252,8 +2252,8 @@ local function spawnEggs(name,count,size,pattern,customCF,batchTag)
         local sz=inf and inf.size or nil
         if sz then
             local nativeSpan=math.max(sz.X,sz.Y,sz.Z,.01)
-            baseFootX=math.max(baseFootX,sz.X*5/nativeSpan)
-            baseFootZ=math.max(baseFootZ,sz.Z*5/nativeSpan)
+            baseFootX=math.max(baseFootX,sz.X*10/nativeSpan)
+            baseFootZ=math.max(baseFootZ,sz.Z*10/nativeSpan)
         end
     end
     if name=="MIXED" then
