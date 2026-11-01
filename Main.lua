@@ -2005,8 +2005,8 @@ local function physicalLayout(count,sizeValue,baseCF,bounds,pattern,footprintX,f
     -- long axis. Never replace the selected count with an area capacity.
     local actualX=math.max(.1,tonumber(footprintX) or (4*scale))
     local actualZ=math.max(.1,tonumber(footprintZ) or (4*scale))
-    local sx=actualX+math.max(1.25,actualX*.08,.45*scale)
-    local sz=actualZ+math.max(1.5,actualZ*.08,.55*scale)
+    local sx=actualX+math.max(.4,actualX*.04,.12*scale)
+    local sz=actualZ+math.max(.5,actualZ*.04,.15*scale)
     local width=math.max(0,((bounds and bounds.X) or COMPACT_SPAWN_BOUNDS.X)-4)
     local depth=math.max(0,((bounds and bounds.Z) or COMPACT_SPAWN_BOUNDS.Z)-4)
     local fitCols=width>=actualX and math.floor((width-actualX)/sx)+1 or 0
@@ -2014,11 +2014,6 @@ local function physicalLayout(count,sizeValue,baseCF,bounds,pattern,footprintX,f
     cols=math.max(minCols,math.min(cols,fitCols))
     local rows=math.ceil(count/cols)
     local fits=fitCols>=cols and ((rows-1)*sz+actualZ)<=depth
-    if fits then
-        -- Spread the complete batch to all four edges, with footprint clearance.
-        if cols>1 then sx=(width-actualX)/(cols-1) end
-        if rows>1 then sz=(depth-actualZ)/(rows-1) end
-    end
     return cols,rows,sx,sz,fits
 end
 local function layoutPosition(index,count,sizeValue,baseCF,bounds,pattern,footprintX,footprintZ)
@@ -2030,8 +2025,7 @@ local function layoutPosition(index,count,sizeValue,baseCF,bounds,pattern,footpr
     -- on one side of the map.
     local rowStart=row*cols
     local rowCols=math.min(cols,count-rowStart)
-    local rowSpacing=rowCols>1 and sx*(cols-1)/(rowCols-1) or 0
-    local x=(col-(rowCols-1)/2)*rowSpacing
+    local x=(col-(rowCols-1)/2)*sx
     local z=(row-(rows-1)/2)*sz
     local pos=(baseCF*CFrame.new(x,0,z)).Position
     return pos,row,col,cols,rows,sx,sz,rowCols
@@ -2080,7 +2074,14 @@ local function eggPhysics(o,anchored)
     local function f(p) p.Anchored=anchored; p.CanCollide=false; p.CanTouch=false; p.CanQuery=true; p.Massless=not anchored end
     if o:IsA("BasePart") then f(o) else for _,p in ipairs(o:GetDescendants()) do if p:IsA("BasePart") then f(p) end end end
 end
-local function scaleEgg(o,v) local f=math.clamp(v,25,500)/100; if o:IsA("Model") then pcall(function() o:ScaleTo(o:GetScale()*f) end) else o.Size=o.Size*f end; return f end
+local function scaleEgg(o,v,nativeSize)
+    local nativeSpan=nativeSize and math.max(nativeSize.X,nativeSize.Y,nativeSize.Z) or 5
+    -- Scale 300 means a visible 15-stud egg, regardless of the source model's
+    -- native units. A huge source must not make every other species miniature.
+    local f=(math.clamp(v,25,500)/100)*5/math.max(nativeSpan,.01)
+    if o:IsA("Model") then o:ScaleTo(o:GetScale()*f) else o.Size=o.Size*f end
+    return f
+end
 local function weldEgg(o)
     if not o:IsA("Model") then return end; local r=rootOf(o); if not r then return end
     for _,p in ipairs(o:GetDescendants()) do if p:IsA("BasePart") and p~=r and not p:FindFirstChild("SAE_Weld") then local w=Instance.new("WeldConstraint"); w.Name="SAE_Weld"; w.Part0=r; w.Part1=p; w.Parent=p end end
@@ -2242,16 +2243,17 @@ local function spawnEggs(name,count,size,pattern,customCF,batchTag)
     size=math.clamp(tonumber(size) or 300,25,500)
     pattern=pattern or PATTERNS[1]
 
-    -- Measure this batch before placing it. For MIXED we use the largest visual
-    -- footprint in the available set so no larger egg silently closes the gap.
-    local baseFootX=4
-    local baseFootZ=4
+    -- Compare normalized visible sizes, never raw mixed-asset dimensions.
+    -- Every species uses the same visible span for a given slider value.
+    local baseFootX=0
+    local baseFootZ=0
     local function includeFootprint(eggName)
         local inf=eggName and templateInfo(eggName) or nil
         local sz=inf and inf.size or nil
         if sz then
-            baseFootX=math.max(baseFootX,sz.X)
-            baseFootZ=math.max(baseFootZ,sz.Z)
+            local nativeSpan=math.max(sz.X,sz.Y,sz.Z,.01)
+            baseFootX=math.max(baseFootX,sz.X*5/nativeSpan)
+            baseFootZ=math.max(baseFootZ,sz.Z*5/nativeSpan)
         end
     end
     if name=="MIXED" then
@@ -2288,6 +2290,13 @@ local function spawnEggs(name,count,size,pattern,customCF,batchTag)
         footprintZ=baseFootZ*visualScale
     end
 
+    -- Keep the dense field at the near end of the usable floor; do not
+    -- distribute a small batch over thousands of studs of empty corridor.
+    local _,fieldRows,_,rowSpacing=physicalLayout(count,size,baseCF,bounds,pattern,footprintX,footprintZ)
+    local fieldDepth=(fieldRows-1)*rowSpacing+footprintZ
+    local nearOffset=math.max(0,((bounds and bounds.Z) or COMPACT_SPAWN_BOUNDS.Z)-4-fieldDepth)/2
+    baseCF=baseCF*CFrame.new(0,0,nearOffset)
+
     local groundHeights={}
     for i=1,count do
         local wanted=layoutPosition(i,count,size,baseCF,bounds,pattern,footprintX,footprintZ)
@@ -2315,7 +2324,7 @@ local function spawnEggs(name,count,size,pattern,customCF,batchTag)
                 if batchTag then egg:SetAttribute("SAE_Batch",batchTag) end
                 egg.Parent=EggFolder
 
-                local scale=scaleEgg(egg,size)
+                local scale=scaleEgg(egg,size,info.size)
                 eggPhysics(egg,true)
 
                 -- Re-measure after scaling: invisible roots and pivot padding
