@@ -2219,38 +2219,50 @@ local function weldEgg(o)
     if not o:IsA("Model") then return end; local r=rootOf(o); if not r then return end
     for _,p in ipairs(o:GetDescendants()) do if p:IsA("BasePart") and p~=r and not p:FindFirstChild("SAE_Weld") then local w=Instance.new("WeldConstraint"); w.Name="SAE_Weld"; w.Part0=r; w.Part1=p; w.Parent=p end end
 end
+-- Place visible geometry, not the source model's possibly offset root.
+local function alignEggBottom(egg,position,bottomY)
+    local cf,size=eggVisualBounds(egg)
+    if not cf or not size then return false end
+    local current=egg:IsA("Model") and egg:GetPivot() or egg.CFrame
+    pivot(egg,current+Vector3.new(position.X-cf.Position.X,bottomY-(cf.Position.Y-size.Y/2),position.Z-cf.Position.Z))
+    return true
+end
 local function carryEgg(egg,carrier,key,model)
     local st=EggState[egg]
     if not st or st.carried or st.delivered then return false end
-    st.carried=true
-    st.claim=key
-    st.carrier=key
-    if st.prompt then st.prompt.Enabled=false end
-
-    local visualHeight=4
-    pcall(function()
-        if egg:IsA("Model") then visualHeight=egg:GetExtentsSize().Y
-        elseif egg:IsA("BasePart") then visualHeight=egg.Size.Y end
-    end)
-    local lift=.9+math.clamp(visualHeight*.10,0,1.4)
-
-    eggPhysics(egg,true)
-    pivot(egg,carrier.CFrame*CFrame.new(0,lift,-2.8))
-    weldEgg(egg)
     local er=rootOf(egg)
-    if not er then st.carried=false; st.claim=nil; return false end
-
-    eggPhysics(egg,false)
+    if not er then return false end
+    eggPhysics(egg,true)
+    pivot(egg,carrier.CFrame)
+    local _,size=eggVisualBounds(egg)
+    if not size then return false end
+    local hit=groundHitNear(carrier.Position,model)
+    local bottomY=math.max(carrier.Position.Y+.4,(hit and hit.Position.Y or carrier.Position.Y-3)+.6)
+    -- Keep even the largest egg in front of the collector, entirely above floor.
+    local center=carrier.Position+carrier.CFrame.LookVector*(size.Z/2+2)
+    if not alignEggBottom(egg,center,bottomY) then return false end
+    weldEgg(egg)
     local w=Instance.new("WeldConstraint")
-    w.Name="SAE_CarryWeld"
-    w.Part0=carrier
-    w.Part1=er
-    w.Parent=er
+    w.Name="SAE_CarryWeld"; w.Part0=carrier; w.Part1=er; w.Parent=er
+    eggPhysics(egg,false)
+    st.carried=true; st.claim=key; st.carrier=key
+    if st.prompt then st.prompt.Enabled=false end
     return true
 end
 local function dropEgg(egg,pos,delivered)
-    if not egg or not egg.Parent then return end; local r=rootOf(egg); if r then local w=r:FindFirstChild("SAE_CarryWeld"); if w then w:Destroy() end end
-    eggPhysics(egg,true); groundObject(egg,pos,math.random(0,359)); local st=EggState[egg]; if st then st.carried=false; st.carrier=nil; st.claim=nil; st.delivered=delivered==true; if st.prompt then st.prompt.Enabled=not st.delivered end end
+    if not egg or not egg.Parent then return end
+    local r=rootOf(egg)
+    if r then local w=r:FindFirstChild("SAE_CarryWeld"); if w then w:Destroy() end end
+    eggPhysics(egg,true)
+    local hit=groundHitNear(pos,egg)
+    local groundY=hit and hit.Position.Y or pos.Y
+    pivot(egg,CFrame.new(pos.X,groundY+100,pos.Z)*CFrame.Angles(0,math.rad(math.random(0,359)),0))
+    alignEggBottom(egg,pos,groundY+.05)
+    local st=EggState[egg]
+    if st then
+        st.carried=false; st.carrier=nil; st.claim=nil; st.delivered=delivered==true
+        if st.prompt then st.prompt.Enabled=not st.delivered end
+    end
 end
 local function dropHeld()
     if not HeldEgg or not HeldEgg.Parent then HeldEgg=nil; Carry.Visible=false; return end
@@ -3441,62 +3453,70 @@ local Bots={}
 
 -- Collector bots are generated locally and do NOT depend on how many real
 -- players are in the server. Selecting 1-10 always attempts that exact count.
-local BaseBotDescription=nil
-local function getBaseBotDescription()
-    if BaseBotDescription then return BaseBotDescription end
-    local desc=nil
-    pcall(function() desc=Players:GetHumanoidDescriptionFromUserId(P.UserId) end)
-    BaseBotDescription=desc or Instance.new("HumanoidDescription")
-    return BaseBotDescription
-end
-
-local function fallbackBot(i)
-    local d=getBaseBotDescription():Clone()
-    local cols={
-        Color3.fromRGB(245,205,48),Color3.fromRGB(80,175,255),Color3.fromRGB(255,120,120),
-        Color3.fromRGB(125,255,150),Color3.fromRGB(185,120,255),Color3.fromRGB(255,180,90),
-        Color3.fromRGB(105,225,220),Color3.fromRGB(220,220,220),Color3.fromRGB(255,115,220),
-        Color3.fromRGB(150,195,255)
-    }
-    local c=cols[((i-1)%arrlen(cols))+1]
-    pcall(function()
-        d.HeadColor=c
-        d.LeftArmColor=c
-        d.RightArmColor=c
-        d.LeftLegColor=c
-        d.RightLegColor=c
-        d.TorsoColor=c
-        d.HeightScale=.94+((i-1)%4)*.025
-        d.WidthScale=.92+((i-1)%3)*.035
-        d.HeadScale=.95+((i-1)%3)*.025
-    end)
-
-    local model=nil
-    local ok=pcall(function()
-        model=Players:CreateHumanoidModelFromDescription(d,Enum.HumanoidRigType.R15)
-    end)
-    if ok and model then return model end
-
-    -- Last-resort clone: still independent of other players in the server.
-    local ch=P.Character
-    if ch then
-        local oldArchivable=ch.Archivable
-        ch.Archivable=true
-        pcall(function() model=ch:Clone() end)
-        ch.Archivable=oldArchivable
-        if model then
-            for _,o in ipairs(model:GetDescendants()) do
-                if o:IsA("Script") or o:IsA("LocalScript") or o:IsA("Tool") then
-                    pcall(function() o:Destroy() end)
-                end
-            end
-            return model
+local BotAvatarIds=nil
+local BotAvatarDescriptions={}
+local function prepareBotAvatars()
+    if BotAvatarIds then return end
+    local ids,seen={},{}
+    local function add(id)
+        if type(id)=="number" and id>0 and id~=P.UserId and not seen[id] then
+            seen[id]=true; table.insert(ids,id)
         end
     end
+    for _,player in ipairs(Players:GetPlayers()) do add(player.UserId) end
+    -- Friends provide different outfits even in a private server.
+    pcall(function()
+        local pages=Players:GetFriendsAsync(P.UserId)
+        for _,friend in ipairs(pages:GetCurrentPage()) do add(friend.Id) end
+    end)
+    for i=#ids,2,-1 do local j=math.random(1,i); ids[i],ids[j]=ids[j],ids[i] end
+    BotAvatarIds=ids
+end
+local function fallbackBot(i)
+    -- Start with separate classic outfits, rather than recoloring the same avatar.
+    local outfits={
+        {{245,205,48},{13,105,172},{75,151,75}},
+        {{234,184,146},{151,0,0},{27,42,53}},
+        {{204,142,105},{98,37,209},{242,243,243}},
+        {{124,92,70},{0,143,156},{51,88,130}},
+        {{255,219,172},{255,176,0},{91,93,105}},
+        {{163,162,165},{27,42,53},{196,40,28}},
+        {{86,66,54},{242,243,243},{49,107,13}},
+        {{255,204,153},{255,102,204},{72,54,105}},
+        {{218,179,142},{33,84,185},{44,101,29}},
+        {{105,64,40},{218,133,65},{17,17,17}}
+    }
+    local style=outfits[((i-1)%#outfits)+1]
+    local d=Instance.new("HumanoidDescription")
+    d.HeadColor=Color3.fromRGB(unpack(style[1]))
+    d.LeftArmColor=d.HeadColor; d.RightArmColor=d.HeadColor
+    d.TorsoColor=Color3.fromRGB(unpack(style[2]))
+    d.LeftLegColor=Color3.fromRGB(unpack(style[3])); d.RightLegColor=d.LeftLegColor
+    d.HeightScale=.92+((i-1)%4)*.06
+    d.WidthScale=.8+((i-1)%3)*.12
+    d.DepthScale=d.WidthScale
+    d.BodyTypeScale=((i-1)%3)*.45
+    d.ProportionScale=((i-1)%2)*.8
+    local ok,model=pcall(function() return Players:CreateHumanoidModelFromDescription(d,Enum.HumanoidRigType.R15) end)
+    d:Destroy()
+    if ok then return model end
     return nil
 end
-
 local function botAvatar(i)
+    prepareBotAvatars()
+    -- Do not reuse a source avatar within a batch.
+    local id=BotAvatarIds[i]
+    if id then
+        local ok,model=pcall(function()
+            local description=BotAvatarDescriptions[id]
+            if not description then
+                description=Players:GetHumanoidDescriptionFromUserId(id)
+                BotAvatarDescriptions[id]=description
+            end
+            return Players:CreateHumanoidModelFromDescription(description,Enum.HumanoidRigType.R15)
+        end)
+        if ok and model then return model end
+    end
     return fallbackBot(i)
 end
 
