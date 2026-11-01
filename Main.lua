@@ -2387,7 +2387,7 @@ end)
 
 -- Probe through scenery to find the floor, rather than treating the first
 -- decorative hit (or a CanQuery-disabled floor) as a fatal placement error.
-function eggGroundHeight(pos,referenceY)
+function eggGroundHeight(pos,referenceY,strict)
     local rp=RaycastParams.new()
     rp.FilterType=Enum.RaycastFilterType.Exclude
     local excluded={EggFolder,NPCFolder}
@@ -2418,42 +2418,63 @@ function eggGroundHeight(pos,referenceY)
     end
     -- The row positions already fit the measured map rectangle. An isolated
     -- ray miss inside that rectangle must not cancel the entire selected batch.
+    if strict then return nil end
     return referenceY
 end
 
 -- Measure only the corridor ahead of the captured click position, not the
 -- entire map in eight directions. No Safe Zone offset is added to this mode.
+-- Horizontal wall tests are essential: a large floor can continue OUTSIDE walls.
+local function eggWallDistance(origin,direction,distance)
+    local nearest=distance
+    for _,height in ipairs({3,10}) do
+        local rp=RaycastParams.new()
+        rp.FilterType=Enum.RaycastFilterType.Exclude
+        rp.FilterDescendantsInstances={EggFolder,NPCFolder,P.Character}
+        rp.RespectCanCollide=true
+        local hit=workspace:Raycast(origin+Vector3.new(0,height,0),direction*distance,rp)
+        if hit and (not hit.Normal or math.abs(hit.Normal.Y)<.6) then
+            nearest=math.min(nearest,hit.Distance or (hit.Position-origin-Vector3.new(0,height,0)).Magnitude)
+        end
+    end
+    return nearest
+end
 local function playerEggRegion(startFrame)
     local base=startFrame.Position
     local forward=startFrame.LookVector
     local right=startFrame.RightVector
     local function floorAt(point)
-        local hit=playableGroundHit(point,base.Y)
-        return hit and (not hit.Normal or hit.Normal.Y>=.7)
+        return eggGroundHeight(point,base.Y,true)~=nil
     end
-    local depth=24
-    local foundFloor=false
-    local misses=0
-    for distance=24,4096,24 do
-        if floorAt(base+forward*distance) then depth=distance; foundFloor=true; misses=0
-        else misses=misses+1; if misses>=2 then break end end
+    local maxDepth=math.max(0,eggWallDistance(base,forward,4096)-2)
+    local depth=0
+    for distance=0,maxDepth,12 do
+        if not floorAt(base+forward*distance) then break end
+        depth=distance
         eggWorkYield()
     end
-    if not foundFloor then depth=2048 end
-    local half=math.huge
-    for _,distance in ipairs({0,math.min(depth*.25,120),math.min(depth*.5,240)}) do
+    -- Never invent a 2048-stud floor when a probe fails.
+    if depth<12 then return nil,nil end
+    local left,rightEdge=120,120
+    for distance=0,depth,24 do
         local centre=base+forward*distance
+        local limits={}
         for _,side in ipairs({-1,1}) do
+            local limit=math.max(0,eggWallDistance(centre,right*side,120)-2)
             local extent=0
-            for offset=6,120,6 do
-                if floorAt(centre+right*(offset*side)) then extent=offset else break end
-                eggWorkYield()
+            for offset=0,limit,6 do
+                if not floorAt(centre+right*(offset*side)) then break end
+                extent=offset
             end
-            if extent>=12 then half=math.min(half,extent) end
+            limits[side]=extent
         end
+        left=math.min(left,limits[-1]); rightEdge=math.min(rightEdge,limits[1])
+        eggWorkYield()
     end
-    local width=half<math.huge and math.max(24,half*2-4) or COMPACT_SPAWN_BOUNDS.X
-    return startFrame,Vector3.new(width,1,depth)
+    if left+rightEdge<12 then return nil,nil end
+    -- An off-centre player must not produce a symmetric field through one wall.
+    local centre=base+right*((rightEdge-left)/2)
+    return CFrame.lookAt(centre,centre+forward),Vector3.new(left+rightEdge,1,depth)
 end
 
 local EggBatchBusy=false
@@ -2487,8 +2508,11 @@ local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgres
         local sz=inf and inf.size or nil
         if sz then
             local nativeSpan=math.max(sz.X,sz.Y,sz.Z,.01)
-            baseFootX=math.max(baseFootX,sz.X*10/nativeSpan)
-            baseFootZ=math.max(baseFootZ,sz.Z*10/nativeSpan)
+            -- Clones retain their source orientation; a square footprint remains
+            -- safe even when the corridor is rotated relative to those models.
+            local span=math.max(sz.X,sz.Z)*10/nativeSpan
+            baseFootX=math.max(baseFootX,span)
+            baseFootZ=math.max(baseFootZ,span)
         end
     end
     if name=="MIXED" then
@@ -2502,6 +2526,7 @@ local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgres
 
     local baseCF,bounds
     if startFrame then baseCF,bounds=playerEggRegion(startFrame) else baseCF,bounds=visibleSpawnFrame(customCF,count,pattern,size) end
+    if not baseCF or not bounds then return false,"No usable floor ahead. Face along the corridor and try again." end
     local baseY=eggGroundHeight(baseCF.Position,baseCF.Position.Y)
     local forward=Vector3.new(baseCF.LookVector.X,0,baseCF.LookVector.Z)
     if forward.Magnitude<.01 then forward=Vector3.new(0,0,-1) else forward=forward.Unit end
@@ -2535,7 +2560,7 @@ local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgres
 
     local function batchPosition(index)
         local pos,row,col,cols,rows,sx,sz,rowCols=layoutPosition(index,count,size,baseCF,bounds,pattern,footprintX,footprintZ)
-        if startFrame then pos=(baseCF*CFrame.new((col-(rowCols-1)/2)*sx,0,-row*sz)).Position end
+        if startFrame then pos=(baseCF*CFrame.new((col-(rowCols-1)/2)*sx,0,-(footprintZ/2+2+row*sz))).Position end
         return pos,row,col,cols,rows,sx,sz,rowCols
     end
 
@@ -2602,6 +2627,7 @@ local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgres
                     egg.Parent=EggFolder
                     registerEgg(egg,en,prepared.scale)
                     if not EggState[egg] then error("Egg has no usable pickup root") end
+                    EggState[egg].pickupPosition=Vector3.new(wanted.X,groundHeights[i] or baseY,wanted.Z)
                 end)
                 if ok then
                     made=made+1
@@ -3453,24 +3479,45 @@ local Bots={}
 
 -- Collector bots are generated locally and do NOT depend on how many real
 -- players are in the server. Selecting 1-10 always attempts that exact count.
-local BotAvatarIds=nil
+-- Explicit public avatar sources, independent of server players and friends.
+local COLLECTOR_AVATARS={
+    "Stickmasterluke","asimo3089","Cindering","Dued1","BereZaa",
+    "Loleris","Merely","Seranok","CloneTrooper1019","TheGamer101",
+    "Nikilis","badcc"
+}
 local BotAvatarDescriptions={}
-local function prepareBotAvatars()
-    if BotAvatarIds then return end
-    local ids,seen={},{}
-    local function add(id)
-        if type(id)=="number" and id>0 and id~=P.UserId and not seen[id] then
-            seen[id]=true; table.insert(ids,id)
-        end
+local BotAvatarUsed={}
+local BotAvatarLooks={}
+local function dressCollectorFallback(model,i)
+    local head=model:FindFirstChild("Head")
+    local torso=model:FindFirstChild("UpperTorso") or model:FindFirstChild("Torso")
+    if not head or not torso then return end
+    local palettes={
+        Color3.fromRGB(170,70,255),Color3.fromRGB(0,210,220),Color3.fromRGB(255,160,35),
+        Color3.fromRGB(255,65,100),Color3.fromRGB(80,230,110)
+    }
+    local accent=palettes[((i-1)%#palettes)+1]
+    local function piece(name,body,size,offset,color,neon)
+        local part=Instance.new("Part")
+        part.Name=name; part.Size=size; part.CFrame=body.CFrame*offset
+        part.Color=color; part.Material=neon and Enum.Material.Neon or Enum.Material.SmoothPlastic
+        part.Anchored=false; part.CanCollide=false; part.CanTouch=false; part.CanQuery=false; part.Massless=true
+        part.Parent=model
+        local weld=Instance.new("WeldConstraint");weld.Part0=body;weld.Part1=part;weld.Parent=part
+        return part
     end
-    for _,player in ipairs(Players:GetPlayers()) do add(player.UserId) end
-    -- Friends provide different outfits even in a private server.
-    pcall(function()
-        local pages=Players:GetFriendsAsync(P.UserId)
-        for _,friend in ipairs(pages:GetCurrentPage()) do add(friend.Id) end
-    end)
-    for i=#ids,2,-1 do local j=math.random(1,i); ids[i],ids[j]=ids[j],ids[i] end
-    BotAvatarIds=ids
+    local dark=Color3.fromRGB(28,30,42)
+    piece("CollectorHelmet",head,Vector3.new(2.15,.55,1.3),CFrame.new(0,.55,0),dark)
+    piece("CollectorVisor",head,Vector3.new(1.85,.4,.15),CFrame.new(0,.05,-.66),accent,true)
+    piece("CollectorPack",torso,Vector3.new(1.6,1.7,.65),CFrame.new(0,0,.85),dark)
+    piece("CollectorPackLight",torso,Vector3.new(.35,1.2,.12),CFrame.new(0,0,1.2),accent,true)
+    if i%3==0 then
+        for _,side in ipairs({-1,1}) do piece("CollectorEarpiece",head,Vector3.new(.35,1.1,.5),CFrame.new(side*1.1,.45,0),accent) end
+    elseif i%3==1 then
+        piece("CollectorAntenna",head,Vector3.new(.16,.9,.16),CFrame.new(.6,1.2,0),accent,true)
+    else
+        piece("CollectorCrest",head,Vector3.new(.3,.8,1.25),CFrame.new(0,1,0),accent)
+    end
 end
 local function fallbackBot(i)
     -- Start with separate classic outfits, rather than recoloring the same avatar.
@@ -3499,23 +3546,43 @@ local function fallbackBot(i)
     d.ProportionScale=((i-1)%2)*.8
     local ok,model=pcall(function() return Players:CreateHumanoidModelFromDescription(d,Enum.HumanoidRigType.R15) end)
     d:Destroy()
-    if ok then return model end
+    if ok and model then dressCollectorFallback(model,i); return model end
     return nil
 end
+
 local function botAvatar(i)
-    prepareBotAvatars()
-    -- Do not reuse a source avatar within a batch.
-    local id=BotAvatarIds[i]
-    if id then
-        local ok,model=pcall(function()
-            local description=BotAvatarDescriptions[id]
-            if not description then
-                description=Players:GetHumanoidDescriptionFromUserId(id)
-                BotAvatarDescriptions[id]=description
+    for offset=0,#COLLECTOR_AVATARS-1 do
+        local name=COLLECTOR_AVATARS[((i-1+offset)%#COLLECTOR_AVATARS)+1]
+        if not BotAvatarUsed[name] then
+            local look=nil
+            local ok,model=pcall(function()
+                local description=BotAvatarDescriptions[name]
+                if not description then
+                    local id=Players:GetUserIdFromNameAsync(name)
+                    description=Players:GetHumanoidDescriptionFromUserId(id)
+                    -- Skip unloaded/default outfits instead of repeating blank bodies.
+                    local dressed=description.Shirt>0 or description.Pants>0
+                    for _,field in ipairs({"HatAccessory","HairAccessory","FaceAccessory","BackAccessory","FrontAccessory","ShouldersAccessory"}) do
+                        if description[field]~="" then dressed=true end
+                    end
+                    if not dressed then return nil end
+                    BotAvatarDescriptions[name]=description
+                end
+                local signature={tostring(description.Shirt),tostring(description.Pants),tostring(description.Face)}
+                for _,field in ipairs({"HatAccessory","HairAccessory","FaceAccessory","BackAccessory","FrontAccessory","ShouldersAccessory","WaistAccessory"}) do
+                    table.insert(signature,tostring(description[field]))
+                end
+                look=table.concat(signature,"|")
+                if BotAvatarLooks[look] then return nil end
+                return Players:CreateHumanoidModelFromDescription(description,Enum.HumanoidRigType.R15)
+            end)
+            if ok and model then
+                BotAvatarUsed[name]=true
+                BotAvatarLooks[look]=true
+                model:SetAttribute("CollectorAvatarSource",name)
+                return model
             end
-            return Players:CreateHumanoidModelFromDescription(description,Enum.HumanoidRigType.R15)
-        end)
-        if ok and model then return model end
+        end
     end
     return fallbackBot(i)
 end
@@ -3553,7 +3620,69 @@ local function horizontalDistance(a,b)
     return math.sqrt(dx*dx+dz*dz)
 end
 
-local function nearestEgg(pos,key)
+local CollectorPathfinding=game:GetService("PathfindingService")
+local function eggPickupPosition(egg)
+    local st=EggState[egg]
+    if st and st.pickupPosition then return st.pickupPosition end
+    local cf,size=eggVisualBounds(egg)
+    local pos=cf and Vector3.new(cf.Position.X,cf.Position.Y-size.Y/2,cf.Position.Z)
+    if st then st.pickupPosition=pos end
+    return pos
+end
+local function moveCollector(d,h,r,goal)
+    local now=os.clock()
+    local nav=d.navigation
+    if not nav or horizontalDistance(nav.goal,goal)>5 then
+        nav={goal=goal,lastPosition=r.Position,lastProgress=now,lastRequest=-10,generation=0}
+        d.navigation=nav
+    end
+    if horizontalDistance(nav.lastPosition,r.Position)>1 then
+        nav.lastPosition=r.Position; nav.lastProgress=now
+    end
+    local rp=RaycastParams.new()
+    rp.FilterType=Enum.RaycastFilterType.Exclude
+    rp.FilterDescendantsInstances={EggFolder,NPCFolder,P.Character}
+    rp.RespectCanCollide=true
+    local flatGoal=Vector3.new(goal.X,r.Position.Y,goal.Z)
+    local obstruction=workspace:Raycast(r.Position,flatGoal-r.Position,rp)
+    if (obstruction or now-nav.lastProgress>1.2) and not nav.computing and now-nav.lastRequest>1 then
+        nav.computing=true;nav.lastRequest=now;nav.generation=nav.generation+1
+        local generation=nav.generation
+        local from=r.Position
+        task.spawn(function()
+            local ok,points=pcall(function()
+                local path=CollectorPathfinding:CreatePath({AgentRadius=2.5,AgentHeight=6,AgentCanJump=true,WaypointSpacing=6})
+                path:ComputeAsync(from,goal)
+                if path.Status==Enum.PathStatus.Success then return path:GetWaypoints() end
+            end)
+            if d.navigation==nav and generation==nav.generation then
+                nav.computing=false
+                if ok and points and #points>0 then nav.points=points;nav.index=2 end
+            end
+        end)
+    end
+    local destination=goal
+    if nav.points then
+        local point=nav.points[nav.index]
+        while point and horizontalDistance(r.Position,point.Position)<3 do
+            nav.index=nav.index+1;point=nav.points[nav.index]
+        end
+        if point then
+            destination=point.Position
+            if point.Action==Enum.PathWaypointAction.Jump then h.Jump=true end
+        else nav.points=nil end
+    end
+    if now-nav.lastProgress>2 then h.Jump=true end
+    if now-nav.lastProgress>6 then
+        -- Recover at a known floor position instead of pushing against a wall forever.
+        placeNPC(d.model,d.home or goal,d.homeDirection or Vector3.new(0,0,-1))
+        d.navigation=nil
+        return
+    end
+    h:MoveTo(destination)
+end
+
+local function nearestEgg(pos,key,blocked)
     local best=nil
     local dist=math.huge
     local now=os.clock()
@@ -3563,10 +3692,10 @@ local function nearestEgg(pos,key)
                 st.claim=nil
                 st.claimTime=nil
             end
-            if not st.claim or st.claim==key then
-                local r=st.root or rootOf(e)
-                if r then
-                    local d=horizontalDistance(r.Position,pos)
+            if (not st.claim or st.claim==key) and (not blocked or not blocked[e] or blocked[e]<=now) then
+                local position=eggPickupPosition(e)
+                if position then
+                    local d=horizontalDistance(position,pos)
                     if d<dist then dist=d; best=e end
                 end
             end
@@ -3621,7 +3750,7 @@ local function botBrain(d)
                     d.returnStarted=os.clock()
                     d.returnTimeout=math.max(8,horizontalDistance(r.Position,home)/math.max(d.speed,1)+5)
                 end
-                h:MoveTo(home)
+                moveCollector(d,h,r,home)
                 local arrived=horizontalDistance(r.Position,home)<=3.5 and math.abs(r.Position.Y-home.Y)<=8
                 if arrived or os.clock()-d.returnStarted>d.returnTimeout then
                     -- A blocked bot still retires at home instead of remaining stuck.
@@ -3637,7 +3766,7 @@ local function botBrain(d)
             elseif carried and carried.Parent then
                 local sp=safePosition()
                 if sp then
-                    h:MoveTo(sp)
+                    moveCollector(d,h,r,sp)
                     if horizontalDistance(r.Position,sp)<=10 then
                         dropEgg(carried,sp+Vector3.new(math.random(-35,35)/10,0,math.random(-35,35)/10),true)
                         carried=nil
@@ -3658,7 +3787,7 @@ local function botBrain(d)
                 end
 
                 if not target then
-                    target=nearestEgg(r.Position,d.key)
+                    target=nearestEgg(r.Position,d.key,d.blocked)
                     if target and EggState[target] then
                         EggState[target].claim=d.key
                         EggState[target].claimTime=os.clock()
@@ -3668,11 +3797,10 @@ local function botBrain(d)
                 end
 
                 if target then
-                    local er=rootOf(target)
-                    if er then
-                        local hit=groundHitNear(er.Position,m)
-                        h:MoveTo(hit and hit.Position or er.Position)
-                        local hd=horizontalDistance(r.Position,er.Position)
+                    local position=eggPickupPosition(target)
+                    if position then
+                        moveCollector(d,h,r,position)
+                        local hd=horizontalDistance(r.Position,position)
                         if hd<=12 then
                             if carryEgg(target,r,d.key,m) then
                                 carried=target
@@ -3686,6 +3814,11 @@ local function botBrain(d)
                             if lastDistance and hd<lastDistance-1 then stuckSince=os.clock() end
                             lastDistance=hd
                             if os.clock()-stuckSince>4.5 then
+                                d.blocked=d.blocked or {}
+                                d.blocked[target]=os.clock()+12
+                                placeNPC(m,d.home or r.Position,d.homeDirection or Vector3.new(0,0,-1))
+                                d.navigation=nil
+                                h.Jump=true
                                 if EggState[target] then EggState[target].claim=nil; EggState[target].claimTime=nil end
                                 target=nil
                                 lastDistance=nil
@@ -3712,12 +3845,14 @@ local function spawnBots(n)
     if not safe then return false,"Lock the safe zone first." end
 
     clearBots()
+    BotAvatarUsed={}
+    BotAvatarLooks={}
     CollectorsEnabled=true
     n=math.clamp(n,1,10)
     local eggTarget=nil
     local nearest=nearestEgg(safe,"BOT_SPAWN_LOOK")
-    local er=nearest and rootOf(nearest) or nil
-    if er then eggTarget=er.Position end
+    local nearestPosition=nearest and eggPickupPosition(nearest) or nil
+    if nearestPosition then eggTarget=nearestPosition end
     if not eggTarget then eggTarget=select(1,getMapFrame()).Position end
 
     local dir=Vector3.new(eggTarget.X-safe.X,0,eggTarget.Z-safe.Z)
@@ -3744,7 +3879,7 @@ local function spawnBots(n)
                 local id=BOT_NAMES[((i-1)%arrlen(BOT_NAMES))+1]
                 local tr=TRAILS[math.random(1,arrlen(TRAILS))]
                 local stat=math.random(200,270)*1000000
-                local speed=90+((stat-200000000)/70000000)*35
+                local speed=24+((stat-200000000)/70000000)*8
 
                 -- Spawn in a small formation INSIDE the safe zone.
                 local row=math.floor((i-1)/4)
