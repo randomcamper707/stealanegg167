@@ -1405,11 +1405,22 @@ function stripEggTemplate(o)
             or x:IsA("Sound")
             or x:IsA("BodyMover") or x:IsA("Constraint") then
             table.insert(remove,x)
+        elseif x:IsA("ParticleEmitter") or x:IsA("Trail") or x:IsA("Beam") or x:IsA("Light") then
+            x:SetAttribute("SAE_EffectEnabled",x.Enabled)
+            x.Enabled=false
+            if x:IsA("ParticleEmitter") then
+                x.Rate=math.min(x.Rate,6)
+                x.Lifetime=NumberRange.new(math.min(x.Lifetime.Min,2),math.min(x.Lifetime.Max,2))
+            elseif x:IsA("Trail") then
+                x.Lifetime=math.min(x.Lifetime,.25)
+            elseif x:IsA("Light") then
+                x.Shadows=false
+            end
         elseif x:IsA("BasePart") then
             x.Anchored=true
             x.CanCollide=false
             x.CanTouch=false
-            x.CanQuery=true
+            x.CanQuery=false
             x.Massless=true
             x.CastShadow=false
         end
@@ -2155,12 +2166,60 @@ PickupPrompt.MaxActivationDistance=12
 PickupPrompt.RequiresLineOfSight=false
 PickupPrompt.Enabled=false
 
+local ActiveEggEffects={}
 local function registerEgg(egg,name,scale)
     local r=rootOf(egg)
     if not r then return end
-    EggState[egg]={name=name,scale=scale,prompt=nil,carried=false,delivered=false,claim=nil}
+    local effects={}
+    for _,x in ipairs(egg:GetDescendants()) do
+        if x:GetAttribute("SAE_EffectEnabled")==true then table.insert(effects,x) end
+    end
+    EggState[egg]={name=name,scale=scale,root=r,effects=effects,prompt=nil,carried=false,delivered=false,claim=nil}
     EggByRoot[r]=egg
 end
+
+-- Bound ongoing rendering work independently of whether 200 or 500 eggs exist.
+local function updateEggEffects(pos)
+    local nearby={}
+    if pos then
+        for egg,st in pairs(EggState) do
+            local r=st.root
+            if egg.Parent and r and r.Parent and #st.effects>0 then
+                local distance=(r.Position-pos).Magnitude
+                if distance<=80 then table.insert(nearby,{effects=st.effects,distance=distance}) end
+            end
+        end
+        table.sort(nearby,function(a,b) return a.distance<b.distance end)
+    end
+    local desired={}
+    local budget=24
+    for i=1,math.min(6,#nearby) do
+        for j=1,math.min(4,#nearby[i].effects) do
+            if budget<=0 then break end
+            desired[nearby[i].effects[j]]=true
+            budget=budget-1
+        end
+    end
+    for effect in pairs(ActiveEggEffects) do
+        if not desired[effect] and effect.Parent then
+            effect.Enabled=false
+            if effect:IsA("ParticleEmitter") then effect:Clear() end
+        end
+    end
+    for effect in pairs(desired) do
+        if effect.Parent then effect.Enabled=true end
+    end
+    ActiveEggEffects=desired
+end
+
+task.spawn(function()
+    while Gui.Parent do
+        task.wait(.5)
+        local r=P.Character and P.Character:FindFirstChild("HumanoidRootPart")
+        updateEggEffects(r and r.Position or nil)
+    end
+    updateEggEffects(nil)
+end)
 
 PickupPrompt.Triggered:Connect(function()
     local r=PickupPrompt.Parent
@@ -2189,7 +2248,7 @@ task.spawn(function()
             if cr then
                 for egg,st in pairs(EggState) do
                     if egg and egg.Parent and not st.carried and not st.delivered then
-                        local r=rootOf(egg)
+                        local r=st.root or rootOf(egg)
                         if r then
                             local d=(r.Position-cr.Position).Magnitude
                             if d<best then
@@ -2325,6 +2384,24 @@ local function spawnEggs(name,count,size,pattern,customCF,batchTag)
         if i%25==0 then task.wait() end
     end
 
+    -- Scale and measure each distinct species once, not every placed copy.
+    local batchTemplates={}
+    local function preparedEgg(en,info)
+        if batchTemplates[en] then return batchTemplates[en] end
+        local template=info.template:Clone()
+        local scale=scaleEgg(template,size,info.size)
+        local visualCF,visualSize=eggVisualBounds(template)
+        if not visualCF then template:Destroy(); return nil end
+        local pivotCF=template:IsA("Model") and template:GetPivot() or template.CFrame
+        local bottom=visualCF.Position.Y-visualSize.Y/2
+        local offset=pivotCF.Position+Vector3.new(-visualCF.Position.X,-bottom,-visualCF.Position.Z)
+        pivot(template,CFrame.new(offset))
+        local prepared={template=template,offset=offset,scale=scale}
+        batchTemplates[en]=prepared
+        return prepared
+    end
+    local sliceStart=os.clock()
+
     local made=0
     local lastCols=0
     local lastRows=0
@@ -2340,30 +2417,26 @@ local function spawnEggs(name,count,size,pattern,customCF,batchTag)
         local info=en and templateInfo(en) or nil
         if info then
             local ok=pcall(function()
-                local egg=info.template:Clone()
+                local prepared=preparedEgg(en,info)
+                if not prepared then return end
+                local egg=prepared.template:Clone()
                 egg.Name=en
                 if batchTag then egg:SetAttribute("SAE_Batch",batchTag) end
+                local offset=prepared.offset
+                pivot(egg,CFrame.new(wanted.X+offset.X,(groundHeights[i] or baseY)+offset.Y,wanted.Z+offset.Z))
+                -- Parent only once the clone is ready; effects are already disabled.
                 egg.Parent=EggFolder
-
-                local scale=scaleEgg(egg,size,info.size)
-                eggPhysics(egg,true)
-
-                -- Re-measure after scaling: invisible roots and pivot padding
-                -- must not hold the visible shell above the local floor.
-                local visualCF,visualSize=eggVisualBounds(egg)
-                if not visualCF then egg:Destroy(); error("Egg has no visible parts") end
-                local pivotCF=egg:IsA("Model") and egg:GetPivot() or egg.CFrame
-                local bottom=visualCF.Position.Y-visualSize.Y/2
-                local delta=Vector3.new(wanted.X-visualCF.Position.X,(groundHeights[i] or baseY)-bottom,wanted.Z-visualCF.Position.Z)
-                pivot(egg,CFrame.new(pivotCF.Position+delta))
-
-                registerEgg(egg,en,scale)
+                registerEgg(egg,en,prepared.scale)
                 made=made+1
             end)
         end
 
-        if i%25==0 then task.wait() end
+        if i%4==0 or os.clock()-sliceStart>=.004 then
+            task.wait()
+            sliceStart=os.clock()
+        end
     end
+    for _,prepared in pairs(batchTemplates) do prepared.template:Destroy() end
 
     if made<=0 then
         return false,"The game egg visuals were found, but none could be cloned."
@@ -2383,6 +2456,7 @@ local function clearSpawnedEggs(batchTag)
             EggState[e]=nil
             pcall(function() e:Destroy() end)
             removed=removed+1
+            if removed%8==0 then task.wait() end
         end
     end
     if HeldEgg and not HeldEgg.Parent then HeldEgg=nil; Carry.Visible=false end
@@ -3269,7 +3343,7 @@ local function nearestEgg(pos,key)
                 st.claimTime=nil
             end
             if not st.claim or st.claim==key then
-                local r=rootOf(e)
+                local r=st.root or rootOf(e)
                 if r then
                     local d=horizontalDistance(r.Position,pos)
                     if d<dist then dist=d; best=e end
@@ -3756,7 +3830,11 @@ local spawnBtn=button(EggsPage,"Spawn behind me",UDim2.fromOffset(4,210),UDim2.n
 local clearEggBtn=button(EggsPage,"Clear eggs",UDim2.new(.5,4,0,210),UDim2.new(.5,-8,0,34),true)
 local spawnStatus=label(EggsPage,"Spawns eggs behind you, facing your direction.",UDim2.fromOffset(5,250),UDim2.new(1,-10,0,36),11)
 spawnStatus.TextWrapped=true; spawnStatus.TextColor3=C.muted
+local EggSpawnBusy=false
 spawnBtn.MouseButton1Click:Connect(function()
+    if EggSpawnBusy then return end
+    EggSpawnBusy=true
+    local ok,err=pcall(function()
     spawnBtn.Text="SPAWNING..."
     local en=EGGS[EggIndex]
     -- Each click is one clean batch, so choosing 500 means exactly 500 GENERAL eggs.
@@ -3776,7 +3854,10 @@ spawnBtn.MouseButton1Click:Connect(function()
             spawnStatus.Text=tostring(made); spawnStatus.TextColor3=C.red
         end
     end
+    end)
+    EggSpawnBusy=false
     spawnBtn.Text="Spawn behind me"
+    if not ok then spawnStatus.Text="Unable to spawn eggs: "..tostring(err); spawnStatus.TextColor3=C.red end
 end)
 clearEggBtn.MouseButton1Click:Connect(function() local n=clearSpawnedEggs(); spawnStatus.Text="Cleared "..n.." spawned egg(s)."; spawnStatus.TextColor3=C.green end)
 
