@@ -1325,15 +1325,19 @@ function usableEggSource(o,container)
     if not o or o==EggFolder or o==NPCFolder
         or o:IsDescendantOf(EggFolder) or o:IsDescendantOf(NPCFolder) then return nil end
     local source=nil
+    local exactSpecies=false
     local cur=o
     while cur and cur~=container and not eggAssetCollection(cur) do
         local assembly=cur:IsA("Model") or cur:IsA("Folder") or cur:IsA("Tool")
         local visual=cur:IsA("BasePart") or (assembly and cur:FindFirstChildWhichIsA("BasePart",true))
         if visual then
-            -- Preserve the complete species assembly, including sibling meshes.
-            -- A nested shell/nest/FX model is never its own egg type.
-            if not source or norm(cur.Name):find("egg",1,true) or cur:GetAttribute("EggName")
-                or eggSpeciesName(cur.Name) then source=cur end
+            local named=eggSpeciesName(cur.Name) or (cur:GetAttribute("EggName") and eggSpeciesName(cur:GetAttribute("EggName")))
+            if named then
+                source=cur
+                exactSpecies=true
+            elseif not exactSpecies and (not source or norm(cur.Name):find("egg",1,true)) then
+                source=cur
+            end
         end
         cur=cur.Parent
     end
@@ -1630,24 +1634,14 @@ end
 
 function availableEggs()
     local available,seen={},{}
-    local function add(name,source)
+    -- Match the original repository's explicit species list only. Do not
+    -- turn every discovered egg effect/variant into an extra mixed-batch type.
+    for i=2,arrlen(EGGS) do
+        local name=EGGS[i]
+        local source=findEgg(name)
         if source and not seen[source] and templateInfo(name) then
             seen[source]=true
             table.insert(available,name)
-        end
-    end
-    for i=2,arrlen(EGGS) do add(EGGS[i],findEgg(EGGS[i])) end
-    for _,source in ipairs(eggAssetIndex().sources) do
-        if source.Parent and not seen[source] then
-            local name=source:GetAttribute("EggName") or source.Name
-            local n=norm(name)
-            if n~="egg" and n~="eggs" and n~="eggshell" and n~="eggnest" and n~="eggbase"
-                and n~="eggfx" and n~="eggvfx" and n~="eggstand" and n~="eggpart"
-                and n:find("egg",1,true) and not eggAssetCollection(source)
-                and (not EggCache[name] or EggCache[name]==source) then
-                EggCache[name]=source
-                add(name,source)
-            end
         end
         eggWorkYield()
     end
@@ -2136,12 +2130,12 @@ local function physicalLayout(count,sizeValue,baseCF,bounds,pattern,footprintX,f
     -- long axis. Never replace the selected count with an area capacity.
     local actualX=math.max(.1,tonumber(footprintX) or (4*scale))
     local actualZ=math.max(.1,tonumber(footprintZ) or (4*scale))
-    local sx=actualX+math.max(.15,actualX*.01,.03*scale)
-    local sz=actualZ+math.max(.1,actualZ*.005,.02*scale)
+    local sx=actualX+math.max(.2,actualX*.02,.06*scale)
+    local sz=actualZ+math.max(.125,actualZ*.01,.0375*scale)
     local width=math.max(0,((bounds and bounds.X) or COMPACT_SPAWN_BOUNDS.X)-4)
     local depth=math.max(0,((bounds and bounds.Z) or COMPACT_SPAWN_BOUNDS.Z)-4)
     local fitCols=width>=actualX and math.floor((width-actualX)/sx)+1 or 0
-    local minCols=1
+    local minCols=math.min(count,3)
     cols=math.max(minCols,math.min(cols,fitCols))
     local rows=math.ceil(count/cols)
     local fits=fitCols>=cols and ((rows-1)*sz+actualZ)<=depth
@@ -2206,8 +2200,8 @@ local function eggPhysics(o,anchored)
     if o:IsA("BasePart") then f(o) else for _,p in ipairs(o:GetDescendants()) do if p:IsA("BasePart") then f(p) end end end
 end
 local function scaleEgg(o,v,nativeSize)
-    local nativeSpan=nativeSize and nativeSize.Y or 10
-    -- Scale 300 means a visible height of 30 studs for every egg, regardless of its
+    local nativeSpan=nativeSize and math.max(nativeSize.X,nativeSize.Y,nativeSize.Z) or 10
+    -- Scale 300 means a visible 30-stud egg, regardless of the source model's
     -- native units. A huge source must not make every other species miniature.
     local f=(math.clamp(v,25,500)/100)*10/math.max(nativeSpan,.01)
     if o:IsA("Model") then o:ScaleTo(o:GetScale()*f) else o.Size=o.Size*f end
@@ -2437,7 +2431,7 @@ local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgres
         local inf=eggName and templateInfo(eggName) or nil
         local sz=inf and inf.size or nil
         if sz then
-            local nativeSpan=math.max(sz.Y,.01)
+            local nativeSpan=math.max(sz.X,sz.Y,sz.Z,.01)
             baseFootX=math.max(baseFootX,sz.X*10/nativeSpan)
             baseFootZ=math.max(baseFootZ,sz.Z*10/nativeSpan)
         end
@@ -2476,42 +2470,16 @@ local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgres
         footprintZ=baseFootZ*visualScale
     end
 
-    -- Pack each row using the actual selected eggs' widths and depths.
-    -- A wide-winged species must not reserve its width around every narrow egg.
-    local columns,rowCount=physicalLayout(count,size,baseCF,bounds,pattern,footprintX,footprintZ)
-    local plans,packedRows={},{}
-    local xGap=math.max(.15,footprintX*.01,.03*visualScale)
-    local zGap=math.max(.1,footprintZ*.005,.02*visualScale)
-    for i=1,count do
-        local row=math.floor((i-1)/columns)
-        local col=(i-1)%columns
-        local rowCols=math.min(columns,count-row*columns)
-        local en=name=="MIXED" and mixedEggFor(pattern,mix,row,col,i,rowCols) or name
-        local info=templateInfo(en)
-        local factor=(size/100)*10/math.max(info.size.Y,.01)
-        local entry={name=en,width=info.size.X*factor,depth=info.size.Z*factor,row=row,col=col,rowCols=rowCols}
-        plans[i]=entry
-        local r=packedRows[row+1]
-        if not r then r={items={},width=0,depth=0}; packedRows[row+1]=r end
-        if #r.items>0 then r.width=r.width+xGap end
-        r.width=r.width+entry.width
-        r.depth=math.max(r.depth,entry.depth)
-        table.insert(r.items,entry)
-    end
-    local nearZ=(((bounds and bounds.Z) or COMPACT_SPAWN_BOUNDS.Z)-4)/2
-    for _,r in ipairs(packedRows) do
-        local z=nearZ-r.depth/2
-        local x=-r.width/2
-        for _,entry in ipairs(r.items) do
-            entry.wanted=(baseCF*CFrame.new(x+entry.width/2,0,z)).Position
-            x=x+entry.width+xGap
-        end
-        nearZ=nearZ-r.depth-zGap
-    end
+    -- Keep the dense field at the near end of the usable floor; do not
+    -- distribute a small batch over thousands of studs of empty corridor.
+    local _,fieldRows,_,rowSpacing=physicalLayout(count,size,baseCF,bounds,pattern,footprintX,footprintZ)
+    local fieldDepth=(fieldRows-1)*rowSpacing+footprintZ
+    local nearOffset=math.max(0,((bounds and bounds.Z) or COMPACT_SPAWN_BOUNDS.Z)-4-fieldDepth)/2
+    baseCF=baseCF*CFrame.new(0,0,nearOffset)
 
     local groundHeights={}
     for i=1,count do
-        local wanted=plans[i].wanted
+        local wanted=layoutPosition(i,count,size,baseCF,bounds,pattern,footprintX,footprintZ)
         groundHeights[i]=eggGroundHeight(wanted,baseY)
         if i%25==0 then task.wait() end
     end
@@ -2543,21 +2511,15 @@ local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgres
     local lastError=nil
 
     for i=1,count do
-        local entry=plans[i]
-        local wanted=entry.wanted
-        lastCols=columns
-        lastRows=rowCount
-        local preferred=entry.name
+        local wanted,row,col,cols,rows,_,_,rowCols=layoutPosition(i,count,size,baseCF,bounds,pattern,footprintX,footprintZ)
+        lastCols=cols
+        lastRows=rows
+        local preferred=name
+        if name=="MIXED" then preferred=mixedEggFor(pattern,mix,row,col,i,rowCols or cols) end
         local candidates={preferred}
         if mix then
             for _,alternative in ipairs(mix) do
-                if alternative~=preferred then
-                    local alt=templateInfo(alternative)
-                    local factor=alt and (size/100)*10/math.max(alt.size.Y,.01) or 0
-                    if alt and alt.size.X*factor<=entry.width+.001 and alt.size.Z*factor<=entry.depth+.001 then
-                        table.insert(candidates,alternative)
-                    end
-                end
+                if alternative~=preferred then table.insert(candidates,alternative) end
             end
         end
         local placed=false
