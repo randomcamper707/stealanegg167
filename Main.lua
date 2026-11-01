@@ -3665,6 +3665,7 @@ local COLLECTOR_AVATARS={
 local BotAvatarDescriptions={}
 local BotAvatarUsed={}
 local BotAvatarLooks={}
+local CollectorAvatarSerial=0
 local function dressCollectorFallback(model,i)
     local head=model:FindFirstChild("Head")
     local torso=model:FindFirstChild("UpperTorso") or model:FindFirstChild("Torso")
@@ -3728,10 +3729,14 @@ local function fallbackBot(i)
 end
 
 local function botAvatar(i)
+    CollectorAvatarSerial=CollectorAvatarSerial+1
+    local sequence=CollectorAvatarSerial
     for offset=0,#COLLECTOR_AVATARS-1 do
-        local name=COLLECTOR_AVATARS[((i-1+offset)%#COLLECTOR_AVATARS)+1]
+        local name=COLLECTOR_AVATARS[((sequence-1+offset)%#COLLECTOR_AVATARS)+1]
         if not BotAvatarUsed[name] then
+            BotAvatarUsed[name]=sequence
             local look=nil
+            local reservedLook=false
             local ok,model=pcall(function()
                 local description=BotAvatarDescriptions[name]
                 if not description then
@@ -3751,17 +3756,27 @@ local function botAvatar(i)
                 end
                 look=table.concat(signature,"|")
                 if BotAvatarLooks[look] then return nil end
+                BotAvatarLooks[look]=sequence;reservedLook=true
                 return Players:CreateHumanoidModelFromDescription(description,Enum.HumanoidRigType.R15)
             end)
             if ok and model then
-                BotAvatarUsed[name]=true
-                BotAvatarLooks[look]=true
+                BotAvatarUsed[name]=sequence
+                BotAvatarLooks[look]=sequence
                 model:SetAttribute("CollectorAvatarSource",name)
+                model:SetAttribute("CollectorAppearanceSequence",sequence)
+                model.Destroying:Connect(function()
+                    if BotAvatarUsed[name]==sequence then BotAvatarUsed[name]=nil end
+                    if BotAvatarLooks[look]==sequence then BotAvatarLooks[look]=nil end
+                end)
                 return model
             end
+            if BotAvatarUsed[name]==sequence then BotAvatarUsed[name]=nil end
+            if reservedLook and BotAvatarLooks[look]==sequence then BotAvatarLooks[look]=nil end
         end
     end
-    return fallbackBot(i)
+    local model=fallbackBot(sequence)
+    if model then model:SetAttribute("CollectorAppearanceSequence",sequence) end
+    return model
 end
 
 local function botTag(m,id,trailName,stat)
@@ -3881,7 +3896,9 @@ local function nearestEgg(pos,key,blocked)
     return best
 end
 
+local CollectorGeneration=0
 local function clearBots()
+    CollectorGeneration=CollectorGeneration+1
     CollectorsEnabled=false
     for _,b in ipairs(Bots) do
         if b.model and b.model.Parent then b.model:Destroy() end
@@ -3900,7 +3917,38 @@ local function stopCollectors()
     end
 end
 
-local function botBrain(d)
+local botBrain
+local function createCollector(home,direction,slot,generation)
+    if generation~=CollectorGeneration or not CollectorsEnabled then return nil end
+    local ok,m=pcall(function() return botAvatar(slot) end)
+    if not ok or not m then return nil end
+    if generation~=CollectorGeneration or not CollectorsEnabled then m:Destroy();return nil end
+    local h=m:FindFirstChildOfClass("Humanoid")
+    local r=m:FindFirstChild("HumanoidRootPart")
+    if not h or not r then m:Destroy();return nil end
+    local sequence=m:GetAttribute("CollectorAppearanceSequence") or CollectorAvatarSerial
+    m.Name="Egg Collector "..sequence
+    m.Parent=NPCFolder
+    h.DisplayDistanceType=Enum.HumanoidDisplayDistanceType.None
+    h.NameDisplayDistance=0;h.HealthDisplayDistance=0;h.AutoRotate=true
+    r.Anchored=false
+    local id=BOT_NAMES[((sequence-1)%arrlen(BOT_NAMES))+1]
+    local tr=TRAILS[math.random(1,arrlen(TRAILS))]
+    local stat=math.random(200,270)*1000000
+    local speed=72+((stat-200000000)/70000000)*22
+    h.WalkSpeed=speed
+    placeNPC(m,home,direction)
+    local trail=addTrail(m,tr)
+    local d={model=m,key="BOT_"..sequence.."_"..id[2],slot=slot,generation=generation,
+        speed=speed,trail=trail,anim=animations(h),home=r.Position,homeDirection=direction}
+    if generation~=CollectorGeneration or not CollectorsEnabled then m:Destroy();return nil end
+    botTag(m,id,tr[1],stat)
+    table.insert(Bots,d)
+    botBrain(d)
+    return d
+end
+
+botBrain=function(d)
     task.spawn(function()
         local target=nil
         local carried=nil
@@ -3915,8 +3963,8 @@ local function botBrain(d)
             h.WalkSpeed=d.speed
             h.AutoRotate=true
 
-            if d.returning or not CollectorsEnabled then
-                d.returning=true
+            if d.returning or not CollectorsEnabled or d.replacing then
+                d.returning=d.returning or not CollectorsEnabled
                 if target and EggState[target] and EggState[target].claim==d.key then
                     EggState[target].claim=nil
                     EggState[target].claimTime=nil
@@ -3935,6 +3983,10 @@ local function botBrain(d)
                     if carried and carried.Parent then dropEgg(carried,home,true) end
                     carried=nil
                     if d.trail then d.trail.Enabled=false end
+                    if d.replacing and not d.returning and CollectorsEnabled then
+                        -- Select the successor while this appearance is still reserved.
+                        createCollector(home,d.homeDirection or Vector3.new(0,0,-1),d.slot,d.generation)
+                    end
                     m:Destroy()
                     local index=table.find(Bots,d)
                     if index then table.remove(Bots,index) end
@@ -3950,6 +4002,8 @@ local function botBrain(d)
                         target=nil
                         lastDistance=nil
                         stuckSince=os.clock()
+                        d.replacing=true
+                        d.navigation=nil
                     end
                 end
             else
@@ -4036,45 +4090,13 @@ local function spawnBots(n)
     if dir.Magnitude<.1 then dir=Vector3.new(0,0,-1) else dir=dir.Unit end
     local right=Vector3.new(-dir.Z,0,dir.X)
 
+    local generation=CollectorGeneration
     for i=1,n do
-        local ok,m=pcall(function() return botAvatar(i) end)
-        if (not ok) or (not m) then
-            ok,m=pcall(function() return fallbackBot(i) end)
-        end
-        if ok and m then
-            m.Name="Egg Bot "..i
-            m.Parent=NPCFolder
-            local h=m:FindFirstChildOfClass("Humanoid")
-            local r=m:FindFirstChild("HumanoidRootPart")
-            if h and r then
-                h.DisplayDistanceType=Enum.HumanoidDisplayDistanceType.None
-                h.NameDisplayDistance=0
-                h.HealthDisplayDistance=0
-                h.AutoRotate=true
-                r.Anchored=false
-
-                local id=BOT_NAMES[((i-1)%arrlen(BOT_NAMES))+1]
-                local tr=TRAILS[math.random(1,arrlen(TRAILS))]
-                local stat=math.random(200,270)*1000000
-                local speed=65+((stat-200000000)/70000000)*20
-
-                -- Spawn in a small formation INSIDE the safe zone.
-                local row=math.floor((i-1)/4)
-                local col=(i-1)%4
-                local lateral=(col-1.5)*3.4
-                local backward=row*3.2
-                local spawnPos=safe+right*lateral-dir*backward
-                placeNPC(m,spawnPos,dir)
-
-                local trail=addTrail(m,tr)
-                local d={model=m,key="BOT_"..i.."_"..id[2],speed=speed,trail=trail,anim=animations(h),home=r.Position,homeDirection=dir}
-                botTag(m,id,tr[1],stat)
-                table.insert(Bots,d)
-                botBrain(d)
-            else
-                m:Destroy()
-            end
-        end
+        if generation~=CollectorGeneration or not CollectorsEnabled then break end
+        local row=math.floor((i-1)/4)
+        local col=(i-1)%4
+        local spawnPos=safe+right*((col-1.5)*3.4)-dir*(row*3.2)
+        createCollector(spawnPos,dir,i,generation)
         task.wait(.04)
     end
     return true,tostring(arrlen(Bots)).." bots spawned from Safe Zone: "..SafeName
@@ -4240,7 +4262,7 @@ local function showAdminPage(name,push)
     Nav.Visible=(name~="Home")
     -- Size each branch to its controls instead of leaving a tall empty window.
     local heights={
-        Home=172, ["Spawn eggs"]=350,
+        Home=172, ["Spawn eggs"]=206,
         Announcements=312, Preset=336,
         Names=286, ["Avatar Name"]=330, ["Announcements Profile"]=384
     }
@@ -4325,22 +4347,15 @@ local function intSlider(parent,y,minv,maxv,step,initial,title,onChange)
 end
 
 function Builders.SpawnEggs()
--- SPAWN EGGS page
-local selectedEggLabel=label(EggsPage,"100 mixed eggs",UDim2.fromOffset(5,4),UDim2.new(1,-10,0,26),12)
-selectedEggLabel.TextColor3=C.purple2
-
-section(EggsPage,"BATCH",36)
-local amountLabel=label(EggsPage,"100 eggs per batch",UDim2.fromOffset(5,58),UDim2.new(1,-10,0,26),12)
-amountLabel.TextColor3=C.muted
-
-local fixedSizeLabel=label(EggsPage,"Large eggs · 5 per row · 20 rows",UDim2.fromOffset(5,96),UDim2.new(1,-10,0,28),12)
-fixedSizeLabel.TextColor3=C.purple2
-local spawnBtn=button(EggsPage,"Spawn mixed eggs",UDim2.fromOffset(4,148),UDim2.new(.5,-8,0,34),false)
-local clearEggBtn=button(EggsPage,"Clear eggs",UDim2.new(.5,4,0,148),UDim2.new(.5,-8,0,34),true)
-local spawnStatus=label(EggsPage,"Starts at your position and continues forward.",UDim2.fromOffset(5,190),UDim2.new(1,-10,0,36),11)
+-- Compact egg actions; spawning implementation is unchanged.
+local spawnBtn=button(EggsPage,"Spawn mixed eggs",UDim2.fromOffset(4,4),UDim2.new(.5,-8,0,34),false)
+local clearEggBtn=button(EggsPage,"Clear eggs",UDim2.new(.5,4,0,4),UDim2.new(.5,-8,0,34),true)
+local spawnStatus=label(EggsPage,"",UDim2.fromOffset(5,46),UDim2.new(1,-10,0,42),11)
+spawnStatus.Visible=false
 spawnStatus.TextWrapped=true; spawnStatus.TextColor3=C.muted
 local EggSpawnBusy=false
 local function spawnFeedback(text,color)
+    spawnStatus.Visible=true
     spawnStatus.Text=text;spawnStatus.TextColor3=color or C.muted
 end
 spawnBtn.Activated:Connect(function()
@@ -4799,10 +4814,8 @@ for i,n in ipairs({"Collectors","Avatar","Sammy"}) do local b=button(BotTabs,n,U
 -- Collectors tab
 local SafeCard=card(CollectorsPage,UDim2.fromOffset(0,0),UDim2.new(1,-6,0,111)); section(SafeCard,"SAFE ZONE",7)
 local collectorSafeStatus=label(SafeCard,"NOT LOCKED",UDim2.fromOffset(10,29),UDim2.new(1,-20,0,20),10); collectorSafeStatus.Font=Enum.Font.GothamBold; collectorSafeStatus.TextColor3=C.orange
-local autoSafe=button(SafeCard,"AUTO DETECT",UDim2.fromOffset(10,61),UDim2.new(.5,-15,0,34),false)
-local setSafe=button(SafeCard,"SET HERE",UDim2.new(.5,5,0,61),UDim2.new(.5,-15,0,34),true)
+local setSafe=button(SafeCard,"SET HERE",UDim2.fromOffset(10,61),UDim2.new(1,-20,0,34),true)
 local function refreshSafeUI() if safePosition() then collectorSafeStatus.Text="LOCKED - "..SafeName; collectorSafeStatus.TextColor3=C.green else collectorSafeStatus.Text="NOT LOCKED"; collectorSafeStatus.TextColor3=C.orange end end
-autoSafe.MouseButton1Click:Connect(function() local ok,msg=detectSafe(); refreshSafeUI(); if not ok then collectorSafeStatus.Text=msg; collectorSafeStatus.TextColor3=C.red end end)
 setSafe.MouseButton1Click:Connect(function() local ok,msg=setSafeHere(); refreshSafeUI(); if not ok then collectorSafeStatus.Text=msg; collectorSafeStatus.TextColor3=C.red end end)
 local NPCCount=2
 local WaveDelay=5
