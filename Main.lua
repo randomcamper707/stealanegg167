@@ -2005,8 +2005,8 @@ local function physicalLayout(count,sizeValue,baseCF,bounds,pattern,footprintX,f
     -- long axis. Never replace the selected count with an area capacity.
     local actualX=math.max(.1,tonumber(footprintX) or (4*scale))
     local actualZ=math.max(.1,tonumber(footprintZ) or (4*scale))
-    local sx=actualX+math.max(.4,actualX*.04,.12*scale)
-    local sz=actualZ+math.max(.5,actualZ*.04,.15*scale)
+    local sx=actualX+math.max(.2,actualX*.02,.06*scale)
+    local sz=actualZ+math.max(.25,actualZ*.02,.075*scale)
     local width=math.max(0,((bounds and bounds.X) or COMPACT_SPAWN_BOUNDS.X)-4)
     local depth=math.max(0,((bounds and bounds.Z) or COMPACT_SPAWN_BOUNDS.Z)-4)
     local fitCols=width>=actualX and math.floor((width-actualX)/sx)+1 or 0
