@@ -3969,7 +3969,15 @@ local function createCollector(home,direction,slot,generation,arrivingModel,land
     h.WalkSpeed=speed
     placeNPC(m,home,direction)
     local returnHome=r.Position
-    if landingPosition then placeNPC(m,landingPosition,direction) end
+    if landingPosition then
+        placeNPC(m,landingPosition,direction)
+        if arrivingModel and h.RigType==Enum.HumanoidRigType.R6 then
+            local leg=m:FindFirstChild("Left Leg") or m:FindFirstChild("Right Leg")
+            local height=h.HipHeight+r.Size.Y/2+(leg and leg.Size.Y or 2)
+            local standing=Vector3.new(landingPosition.X,landingPosition.Y+height,landingPosition.Z)
+            m:PivotTo(CFrame.lookAt(standing,standing+direction))
+        end
+    end
     local trail=addTrail(m,tr)
     local d={model=m,key="BOT_"..sequence.."_"..id[2],slot=slot,generation=generation,
         speed=speed,trail=trail,anim=animations(h),home=returnHome,homeDirection=direction}
@@ -4215,6 +4223,7 @@ local function teleportCollector(account,onError)
         local model,effects=nil,nil
         local temporary={}
         local collisions={}
+        local originalJoints={}
         local camera=workspace.CurrentCamera
         local savedCamera=nil
         local cameraOwned=false
@@ -4254,6 +4263,47 @@ local function teleportCollector(account,onError)
                     node.CanCollide=false
                 end
             end
+            local joints={}
+            for _,joint in ipairs(model:GetDescendants()) do
+                if joint:IsA("Motor6D") then
+                    originalJoints[joint]={C0=joint.C0,Transform=joint.Transform}
+                    joints[norm(joint.Name)]=joint
+                    joint.Transform=CFrame.new()
+                end
+            end
+            local animator=h:FindFirstChildOfClass("Animator") or Instance.new("Animator",h)
+            pcall(function() for _,track in ipairs(animator:GetPlayingAnimationTracks()) do track:Stop(0) end end)
+            local r15=model:FindFirstChild("UpperTorso")~=nil
+            local function smooth(value)
+                value=math.clamp(value,0,1)
+                return value*value*(3-2*value)
+            end
+            local function jointPose(name,x,y,z)
+                local joint=joints[name]
+                local original=joint and originalJoints[joint]
+                if original then
+                    joint.C0=CFrame.new(original.C0.Position)*CFrame.Angles(math.rad(x),math.rad(y),math.rad(z))*original.C0.Rotation
+                end
+            end
+            local function pose(crouch,lookUp)
+                local lean=r15 and 46 or 50
+                if r15 then jointPose("waist",-lean*crouch,0,0)
+                else jointPose("rootjoint",-lean*crouch,0,0) end
+                jointPose("neck",(lean+23)*lookUp,0,0)
+                jointPose("leftshoulder",(r15 and 48 or 70)*crouch,0,-15*crouch)
+                jointPose("rightshoulder",(r15 and 48 or 70)*crouch,0,15*crouch)
+                if r15 then
+                    jointPose("lefthip",65*crouch,0,-8*crouch)
+                    jointPose("righthip",65*crouch,0,8*crouch)
+                    jointPose("leftknee",-110*crouch,0,0)
+                    jointPose("rightknee",-110*crouch,0,0)
+                    jointPose("leftankle",45*crouch,0,0)
+                    jointPose("rightankle",45*crouch,0,0)
+                else
+                    jointPose("lefthip",-20*crouch,0,-12*crouch)
+                    jointPose("righthip",-20*crouch,0,12*crouch)
+                end
+            end
             CollectorAvatarSerial=CollectorAvatarSerial+1
             model.Name="Teleport arrival "..account.name
             model:SetAttribute("CollectorAppearanceSequence",CollectorAvatarSerial)
@@ -4262,37 +4312,88 @@ local function teleportCollector(account,onError)
             model.PrimaryPart=r
             h.DisplayDistanceType=Enum.HumanoidDisplayDistanceType.None
             h.PlatformStand=true;h.AutoRotate=false;r.Anchored=true
-            local floorRoot=ground+Vector3.new(0,h.HipHeight+r.Size.Y/2,0)
+            local standingHeight=h.HipHeight+r.Size.Y/2
+            if not r15 then
+                local leg=model:FindFirstChild("Left Leg") or model:FindFirstChild("Right Leg")
+                standingHeight=standingHeight+(leg and leg.Size.Y or 2)
+            end
+            local floorRoot=ground+Vector3.new(0,standingHeight,0)
             model:PivotTo(CFrame.lookAt(floorRoot+Vector3.new(0,115,0),floorRoot+Vector3.new(0,115,0)+direction))
             model.Parent=NPCFolder
             effects=Instance.new("Folder");effects.Name="SAE_TeleportArrival";effects.Parent=workspace
-            local clouds={}
-            for i=1,7 do
-                local angle=i*math.pi*2/7
-                local cloud=part("StormCloud",Vector3.new(17,5,13),
-                    CFrame.new(ground+Vector3.new(math.cos(angle)*10,121+(i%3)*2,math.sin(angle)*7)),
-                    Color3.fromRGB(22,15,36),.15,Enum.PartType.Ball)
-                cloud.Material=Enum.Material.SmoothPlastic
-                table.insert(clouds,cloud)
+            local solarAnchor=part("SolarSource",Vector3.new(1,1,1),CFrame.new(ground+Vector3.new(0,120,0)),Color3.fromRGB(255,184,51),1)
+            local solarLight=Instance.new("PointLight")
+            solarLight.Color=Color3.fromRGB(255,169,45);solarLight.Range=65;solarLight.Brightness=6;solarLight.Parent=solarAnchor
+            local sun=Instance.new("BillboardGui")
+            sun.Name="SolarGlow";sun.Size=UDim2.fromScale(58,58);sun.AlwaysOnTop=false
+            sun.LightInfluence=0;sun.MaxDistance=2000;sun.Parent=solarAnchor
+            local glow=Instance.new("ImageLabel")
+            glow.Name="WarmHalo";glow.BackgroundTransparency=1;glow.Size=UDim2.fromScale(1,1)
+            glow.Image="rbxasset://textures/glow.png"
+            glow.ImageColor3=Color3.fromRGB(255,158,32);glow.ImageTransparency=.12;glow.Parent=sun
+            local core=glow:Clone();core.Name="SunCore";core.Position=UDim2.fromScale(.25,.25)
+            core.Size=UDim2.fromScale(.5,.5);core.ImageColor3=Color3.fromRGB(255,245,172);core.Parent=sun
+            local landingAnchor=part("LandingVFX",Vector3.new(1,.1,1),CFrame.lookAt(ground,ground+direction),Color3.fromRGB(255,180,55),1)
+            local topAttachment=Instance.new("Attachment");topAttachment.Parent=solarAnchor
+            local groundAttachment=Instance.new("Attachment");groundAttachment.Parent=landingAnchor
+            local shaft=Instance.new("Beam")
+            shaft.Name="SolarShaft";shaft.Attachment0=topAttachment;shaft.Attachment1=groundAttachment
+            shaft.Width0=16;shaft.Width1=5;shaft.FaceCamera=true;shaft.LightEmission=1
+            shaft.Color=ColorSequence.new(Color3.fromRGB(255,196,74),Color3.fromRGB(255,137,34))
+            shaft.Transparency=NumberSequence.new(.82);shaft.Parent=solarAnchor
+            local dust=Instance.new("ParticleEmitter")
+            dust.Name="LandingSmoke";dust.Texture="rbxasset://textures/particles/smoke_main.dds"
+            dust.Rate=0;dust.Lifetime=NumberRange.new(.6,1.1);dust.Speed=NumberRange.new(10,18)
+            dust.Drag=5;dust.Acceleration=Vector3.new(0,3,0);dust.SpreadAngle=Vector2.new(85,85)
+            dust.Rotation=NumberRange.new(0,360);dust.RotSpeed=NumberRange.new(-70,70)
+            dust.EmissionDirection=Enum.NormalId.Top;dust.LightEmission=.25
+            dust.Color=ColorSequence.new(Color3.fromRGB(211,164,100),Color3.fromRGB(103,91,79))
+            dust.Size=NumberSequence.new({NumberSequenceKeypoint.new(0,1),NumberSequenceKeypoint.new(.5,4),NumberSequenceKeypoint.new(1,7)})
+            dust.Transparency=NumberSequence.new({NumberSequenceKeypoint.new(0,.3),NumberSequenceKeypoint.new(.45,.8),NumberSequenceKeypoint.new(1,1)})
+            dust.Parent=groundAttachment
+            local contacts={}
+            local torso=model:FindFirstChild("UpperTorso") or model:FindFirstChild("Torso") or r
+            local poseScale=math.clamp(torso.Size.X/2,.65,1.6)
+            local function contact(name,upperName,endName,x,z,poleX,poleZ)
+                local upper=model:FindFirstChild(upperName)
+                local endpoint=model:FindFirstChild(endName)
+                if not upper or not endpoint then return end
+                local target=Instance.new("Attachment")
+                target.Name=name.."Contact";target.Position=Vector3.new(x*poseScale,endpoint.Size.Y/2+.04,z*poseScale)
+                target.Parent=landingAnchor
+                local pole=Instance.new("Attachment")
+                pole.Name=name.."Pole";pole.Position=Vector3.new(poleX*poseScale,1,poleZ*poseScale);pole.Parent=landingAnchor
+                local ik=Instance.new("IKControl")
+                ik.Name=name.."LandingIK";ik.Type=Enum.IKControlType.Position
+                ik.ChainRoot=upper;ik.EndEffector=endpoint;ik.Target=target;ik.Pole=pole
+                ik.Weight=0;ik.SmoothTime=.04;ik.Priority=100;ik.Enabled=true;ik.Parent=h
+                table.insert(contacts,ik);table.insert(temporary,ik)
+            end
+            if r15 then
+                contact("LeftHand","LeftUpperArm","LeftHand",-1.1,-1.65,-2.3,-.7)
+                contact("RightHand","RightUpperArm","RightHand",1.1,-1.65,2.3,-.7)
+                contact("LeftFoot","LeftUpperLeg","LeftFoot",-.85,.9,-1,-1.8)
+                contact("RightFoot","RightUpperLeg","RightFoot",.85,.9,1,-1.8)
             end
             local a=Instance.new("Attachment");a.Position=Vector3.new(-.9,.8,0);a.Parent=r
             local b=Instance.new("Attachment");b.Position=Vector3.new(.9,.8,0);b.Parent=r
             local trail=Instance.new("Trail");trail.Attachment0=a;trail.Attachment1=b
-            trail.Color=ColorSequence.new(Color3.fromRGB(193,143,255),Color3.fromRGB(245,235,255))
+            trail.Color=ColorSequence.new(Color3.fromRGB(255,172,48),Color3.fromRGB(255,247,190))
             trail.Lifetime=.22;trail.FaceCamera=true;trail.Parent=r
             table.insert(temporary,a);table.insert(temporary,b);table.insert(temporary,trail)
-            local flash=part("ImpactFlash",Vector3.new(1,1,1),CFrame.new(ground+Vector3.new(0,.3,0)),Color3.fromRGB(221,200,255),1,Enum.PartType.Ball)
-            local light=Instance.new("PointLight");light.Color=Color3.fromRGB(205,166,255);light.Range=45;light.Brightness=0;light.Parent=flash
+            local flash=part("ImpactFlash",Vector3.new(1,1,1),CFrame.new(ground+Vector3.new(0,.3,0)),Color3.fromRGB(255,213,116),1,Enum.PartType.Ball)
+            local light=Instance.new("PointLight");light.Color=Color3.fromRGB(255,174,60);light.Range=45;light.Brightness=0;light.Parent=flash
             local lightning={}
             local function strike()
+                dust:Emit(36)
                 local last=ground+Vector3.new(0,140,0)
                 for i=1,13 do
                     local point=i==13 and (ground+Vector3.new(0,.5,0))
                         or (ground+Vector3.new(math.random(-7,7),140*(1-i/13),math.random(-5,5)))
-                    table.insert(lightning,segment(last,point,.65,Color3.fromRGB(147,77,255),.18))
-                    table.insert(lightning,segment(last,point,.18,Color3.fromRGB(252,245,255),0))
+                    table.insert(lightning,segment(last,point,.65,Color3.fromRGB(255,157,37),.18))
+                    table.insert(lightning,segment(last,point,.18,Color3.fromRGB(255,249,220),0))
                     if i==5 or i==9 then
-                        table.insert(lightning,segment(point,point+Vector3.new(10,-12,-6),.25,Color3.fromRGB(196,143,255),.1))
+                        table.insert(lightning,segment(point,point+Vector3.new(10,-12,-6),.25,Color3.fromRGB(255,200,99),.1))
                     end
                     last=point
                 end
@@ -4317,30 +4418,60 @@ local function teleportCollector(account,onError)
             if cameraHit then cameraPosition=cameraHit.Position+(cameraHit.Normal or Vector3.new(0,1,0))*2 end
             local start=os.clock()
             local struck=false
+            local crouchHeight=math.clamp(standingHeight*.48,.95,2.1)
+            local radius=math.clamp(8*poseScale,6.5,12)
             while true do
                 checkActive()
                 local t=os.clock()-start
-                if t>=2.8 then break end
+                if t>=6.5 then break end
                 local drop=math.clamp((t-.35)/1.15,0,1)
                 local y=115*(1-drop*drop)
-                model:PivotTo(CFrame.lookAt(floorRoot+Vector3.new(0,y,0),floorRoot+Vector3.new(0,y,0)+direction)
+                local crouch=smooth((t-1.33)/.17)*(1-smooth((t-5.7)/.65))
+                local lookUp=smooth((t-2.05)/.65)*(1-smooth((t-5.7)/.65))
+                local rootHeight=standingHeight+(crouchHeight-standingHeight)*crouch
+                local rootPosition=ground+Vector3.new(0,rootHeight+y,0)
+                model:PivotTo(CFrame.lookAt(rootPosition,rootPosition+direction)
                     *CFrame.Angles(math.rad(-12*(1-drop)),0,math.sin(drop*math.pi)*.1))
+                pose(crouch,lookUp)
+                local contactWeight=smooth((t-1.45)/.08)*(1-smooth((t-5.7)/.5))
+                for _,ik in ipairs(contacts) do ik.Weight=contactWeight end
                 if t>=1.5 and not struck then struck=true;strike() end
+                local solarFade=smooth((t-1.4)/1.2)
+                glow.ImageTransparency=.12+.88*solarFade
+                core.ImageTransparency=.08+.92*solarFade
+                solarLight.Brightness=6*(1-solarFade)
+                shaft.Transparency=NumberSequence.new(.82+.18*solarFade)
                 if struck then
                     local impact=t-1.5
                     local pulse=math.clamp(impact/.7,0,1)
-                    flash.Size=Vector3.new(1+22*pulse,.3+1.5*(1-pulse),1+22*pulse)
+                    flash.Size=Vector3.new(1+25*pulse,.3+1.5*(1-pulse),1+25*pulse)
                     flash.Transparency=math.clamp(impact/.65,0,1)
-                    light.Brightness=math.max(0,8*(1-impact/.4))
+                    light.Brightness=math.max(0,10*(1-impact/.45))
                     for _,bolt in ipairs(lightning) do bolt.Transparency=math.clamp((impact-.12)/.25,0,1) end
-                    for _,cloud in ipairs(clouds) do cloud.Transparency=math.clamp(.15+impact,0,1) end
                 end
                 if cameraOwned then
-                    local focus=floorRoot+Vector3.new(0,math.max(2,y*.85),0)
-                    camera.CFrame=CFrame.lookAt(cameraPosition,focus)
-                    camera.FieldOfView=60
+                    local zoom=smooth((t-1.5)/.9)
+                    local orbit=smooth((t-3)/2.7)*math.pi*2
+                    local retreat=smooth((t-5.7)/.65)
+                    local closePosition=ground+(direction*math.cos(orbit)+right*math.sin(orbit))*(radius+3*retreat)
+                        +Vector3.new(0,2.5*poseScale+retreat,0)
+                    local head=model:FindFirstChild("Head")
+                    local closeFocus=ground+Vector3.new(0,1.9*poseScale+retreat,0)
+                    if t<3 and head then closeFocus=head.Position end
+                    local focus=(floorRoot+Vector3.new(0,math.max(2,y*.85),0)):Lerp(closeFocus,zoom)
+                    local desired=cameraPosition:Lerp(closePosition,zoom)
+                    local impact=math.max(0,t-1.5)
+                    local shake=t>=1.5 and .32*math.max(0,1-impact/.45) or 0
+                    desired=desired+Vector3.new(math.sin(t*83)*shake,math.cos(t*91)*shake,0)
+                    local hit=workspace:Raycast(focus,desired-focus,cameraRay)
+                    if hit then desired=hit.Position+(hit.Normal or Vector3.new(0,1,0))*.7 end
+                    camera.CFrame=CFrame.lookAt(desired,focus)
+                    camera.FieldOfView=60-16*zoom+9*smooth((t-3)/.3)+5*retreat
                 end
                 RunService.RenderStepped:Wait()
+            end
+            for joint,original in pairs(originalJoints) do
+                if joint.Parent then joint.C0=original.C0;joint.Transform=original.Transform end
             end
             checkActive()
             for node,collide in pairs(collisions) do if node.Parent then node.CanCollide=collide end end
@@ -4356,6 +4487,9 @@ local function teleportCollector(account,onError)
                 notice(CFG.AnnouncementProfile.UserId,CFG.AnnouncementProfile.Name,"teleported",account.display,"",Enum.Font.FredokaOne)
             end)
         end,debug.traceback)
+        for joint,original in pairs(originalJoints) do
+            if joint.Parent then joint.C0=original.C0;joint.Transform=original.Transform end
+        end
         for _,node in ipairs(temporary) do pcall(function() node:Destroy() end) end
         if not imported and model then pcall(function() model:Destroy() end) end
         if effects then effects:Destroy() end
