@@ -1289,14 +1289,8 @@ EggCache={}
 
 function eggTextMatches(value,want)
     local n=norm(value)
-    if n=="" then return false end
-    if want[n] then return true end
-    -- Only allow the object's name to CONTAIN a configured alias.
-    -- Do not do the reverse: a generic child named "Egg" must never match every egg type.
-    for alias in pairs(want) do
-        if #alias>=5 and #n>=#alias and n:find(alias,1,true) then return true end
-    end
-    return false
+    -- Species names must match, not just occur somewhere in a larger name.
+    return want[n]==true or want[(n:gsub("model$",""):gsub("template$",""))]==true
 end
 
 function matchObj(o,want)
@@ -1321,6 +1315,12 @@ function usableEggSource(o,container)
             return model
         end
         return o
+    end
+
+    if o:IsA("Folder") or o:IsA("Tool") then
+        local model=o:FindFirstChildWhichIsA("Model",true)
+        if model and model:FindFirstChildWhichIsA("BasePart",true) then return model end
+        return o:FindFirstChildWhichIsA("BasePart",true)
     end
 
     local cur=o.Parent
@@ -1422,6 +1422,27 @@ function stripEggTemplate(o)
     for _,x in ipairs(remove) do pcall(function() x:Destroy() end) end
 end
 
+-- Measure rendered parts, excluding invisible pivot/hitbox padding.
+function eggVisualBounds(o)
+    local low=Vector3.new(math.huge,math.huge,math.huge)
+    local high=Vector3.new(-math.huge,-math.huge,-math.huge)
+    local found=false
+    local parts=o:IsA("BasePart") and {o} or o:GetDescendants()
+    for _,p in ipairs(parts) do
+        if p:IsA("BasePart") and p.Transparency<.95 then
+            found=true
+            local half=p.Size/2
+            for _,x in ipairs({-1,1}) do for _,y in ipairs({-1,1}) do for _,z in ipairs({-1,1}) do
+                local v=p.CFrame:PointToWorldSpace(Vector3.new(half.X*x,half.Y*y,half.Z*z))
+                low=Vector3.new(math.min(low.X,v.X),math.min(low.Y,v.Y),math.min(low.Z,v.Z))
+                high=Vector3.new(math.max(high.X,v.X),math.max(high.Y,v.Y),math.max(high.Z,v.Z))
+            end end end
+        end
+    end
+    if not found then return nil end
+    return CFrame.new((low+high)/2),high-low
+end
+
 function templateInfo(name)
     local cached=EggTemplateCache[name]
     if cached then return cached end
@@ -1449,7 +1470,7 @@ function templateInfo(name)
     if clone:IsA("Model") then
         pcall(function() clone:PivotTo(CFrame.new()) end)
         local okBox,cf,sz=pcall(function()
-            local c,z=clone:GetBoundingBox()
+            local c,z=eggVisualBounds(clone)
             return c,z
         end)
         if not okBox or not cf or not sz or sz.Magnitude<.1 or math.max(sz.X,sz.Y,sz.Z)>80 then
@@ -1475,12 +1496,32 @@ function templateInfo(name)
 end
 
 function availableEggs()
-    local a={}
-    for i=2,arrlen(EGGS) do
-        local name=EGGS[i]
-        if templateInfo(name) then table.insert(a,name) end
+    local available,seen={},{}
+    local function add(name,source)
+        if source and not seen[source] and templateInfo(name) then
+            seen[source]=true
+            table.insert(available,name)
+        end
     end
-    return a
+    for i=2,arrlen(EGGS) do add(EGGS[i],findEgg(EGGS[i])) end
+    -- Include current game eggs absent from the older hardcoded catalog.
+    -- Only accept actual egg assets; never fill missing species with pets.
+    for _,container in ipairs({ReplicatedStorage,workspace}) do
+        for _,o in ipairs(container:GetDescendants()) do
+            if o:IsA("Model") or (o:IsA("BasePart") and not o:FindFirstAncestorOfClass("Model")) then
+                local n=norm(o.Name)
+                if n~="egg" and n~="eggs" and n~="eggmodels" and n~="eggassets" and n~="eggtemplates" and #n>3 and eggSourceScore(o,container)
+                    and (o:IsA("BasePart") or o:FindFirstChildWhichIsA("BasePart",true)) and not seen[o] then
+                    local name=o.Name
+                    if not EggCache[name] or EggCache[name]==o then
+                        EggCache[name]=o
+                        add(name,o)
+                    end
+                end
+            end
+        end
+    end
+    return available
 end
 
 -- Safe-zone state is declared before map/layout code so GENERAL egg spawning
@@ -1969,10 +2010,15 @@ local function physicalLayout(count,sizeValue,baseCF,bounds,pattern,footprintX,f
     local width=math.max(0,((bounds and bounds.X) or COMPACT_SPAWN_BOUNDS.X)-4)
     local depth=math.max(0,((bounds and bounds.Z) or COMPACT_SPAWN_BOUNDS.Z)-4)
     local fitCols=width>=actualX and math.floor((width-actualX)/sx)+1 or 0
-    local lengthwiseCols=math.max(1,math.floor(math.sqrt(count*width/math.max(depth,1))))
-    cols=math.max(1,math.min(cols,fitCols,lengthwiseCols))
+    local minCols=math.min(count,6)
+    cols=math.max(minCols,math.min(cols,fitCols))
     local rows=math.ceil(count/cols)
-    local fits=fitCols>0 and ((rows-1)*sz+actualZ)<=depth
+    local fits=fitCols>=cols and ((rows-1)*sz+actualZ)<=depth
+    if fits then
+        -- Spread the complete batch to all four edges, with footprint clearance.
+        if cols>1 then sx=(width-actualX)/(cols-1) end
+        if rows>1 then sz=(depth-actualZ)/(rows-1) end
+    end
     return cols,rows,sx,sz,fits
 end
 local function layoutPosition(index,count,sizeValue,baseCF,bounds,pattern,footprintX,footprintZ)
@@ -1984,7 +2030,8 @@ local function layoutPosition(index,count,sizeValue,baseCF,bounds,pattern,footpr
     -- on one side of the map.
     local rowStart=row*cols
     local rowCols=math.min(cols,count-rowStart)
-    local x=(col-(rowCols-1)/2)*sx
+    local rowSpacing=rowCols>1 and sx*(cols-1)/(rowCols-1) or 0
+    local x=(col-(rowCols-1)/2)*rowSpacing
     local z=(row-(rows-1)/2)*sz
     local pos=(baseCF*CFrame.new(x,0,z)).Position
     return pos,row,col,cols,rows,sx,sz,rowCols
@@ -1996,9 +2043,8 @@ local function mixedEggFor(pattern,mix,row,col,index,cols)
     local function at(i) return mix[(i%n)+1] end
 
     if pattern=="ORIGINAL 6x20" then
-        -- 20 eggs across. Each row uses a six-type sequence and repeats it:
-        -- A B C D E F A B C D E F ...
-        return at(row*6+(col%6))
+        -- Continue the whole catalog across row boundaries, even in narrow grids.
+        return at(index-1)
     elseif pattern=="ONE TYPE PER ROW" then
         -- AAAAA... / BBBBB... / CCCCC...
         return at(row)
@@ -2015,13 +2061,13 @@ local function mixedEggFor(pattern,mix,row,col,index,cols)
     elseif pattern=="MIRRORED ROWS" then
         -- Row 1 runs left-to-right; row 2 is the exact reverse; repeat.
         local sequenceCol=(row%2==0) and col or (cols-1-col)
-        return at(sequenceCol)
+        return at(row*cols+sequenceCol)
     elseif pattern=="ALTERNATING ROWS" then
         -- Full rows alternate A / B / A / B ...
-        return at(row%2)
+        return at(math.floor(row/2)+(row%2)*math.ceil(n/2))
     elseif pattern=="DIAGONAL SEQUENCE" then
         -- Shift the sequence by one type on every new row.
-        return at(row+col)
+        return at(row*cols+col+row)
     end
     return at(index-1)
 end
@@ -2207,6 +2253,7 @@ local function spawnEggs(name,count,size,pattern,customCF,batchTag)
         footprintZ=baseFootZ*visualScale
     end
 
+    local groundHeights={}
     -- Check the centre and four footprint corners before cloning anything.
     -- Missing ground/walls must not silently become floating eggs at baseY.
     for i=1,count do
@@ -2216,6 +2263,7 @@ local function spawnEggs(name,count,size,pattern,customCF,batchTag)
             Vector3.new(footprintX/2,0,footprintZ/2)}) do
             local probe=wanted+baseCF.RightVector*offset.X-baseCF.LookVector*offset.Z
             local hit=playableGroundHit(probe,baseY)
+            if hit and offset.X==0 and offset.Z==0 then groundHeights[i]=hit.Position.Y end
             if not hit or math.abs(hit.Position.Y-baseY)>4 or (hit.Normal and hit.Normal.Y<.7) then
                 return false,"The egg grid crosses a wall or missing floor. Move to a clear part of the map and try again."
             end
@@ -2246,10 +2294,14 @@ local function spawnEggs(name,count,size,pattern,customCF,batchTag)
                 local scale=scaleEgg(egg,size)
                 eggPhysics(egg,true)
 
-                local y=baseY-(info.bottomOffset*scale)+.08
-                local offset=info.centerOffset or Vector3.new()
-                local cf=CFrame.new(wanted.X-offset.X*scale,y,wanted.Z-offset.Z*scale)
-                pivot(egg,cf)
+                -- Re-measure after scaling: invisible roots and pivot padding
+                -- must not hold the visible shell above the local floor.
+                local visualCF,visualSize=eggVisualBounds(egg)
+                if not visualCF then egg:Destroy(); error("Egg has no visible parts") end
+                local pivotCF=egg:IsA("Model") and egg:GetPivot() or egg.CFrame
+                local bottom=visualCF.Position.Y-visualSize.Y/2
+                local delta=Vector3.new(wanted.X-visualCF.Position.X,(groundHeights[i] or baseY)-bottom,wanted.Z-visualCF.Position.Z)
+                pivot(egg,CFrame.new(pivotCF.Position+delta))
 
                 registerEgg(egg,en,scale)
                 made=made+1
@@ -2262,7 +2314,7 @@ local function spawnEggs(name,count,size,pattern,customCF,batchTag)
     if made<=0 then
         return false,"The game egg visuals were found, but none could be cloned."
     end
-    return true,made,lastCols,lastRows,0,size
+    return true,made,lastCols,lastRows,0,size,mix and arrlen(mix) or 1
 end
 
 local function clearSpawnedEggs(batchTag)
@@ -3659,9 +3711,10 @@ spawnBtn.MouseButton1Click:Connect(function()
         spawnStatus.Text="Server spawn request sent."
         spawnStatus.TextColor3=C.green
     else
-        local ok,made,cols,rows,fallbacks,appliedScale=spawnEggs(en,Amount,EggSize,Pattern,nil,"GENERAL")
+        local ok,made,cols,rows,fallbacks,appliedScale,typeCount=spawnEggs(en,Amount,EggSize,Pattern,nil,"GENERAL")
         if ok then
             spawnStatus.Text=tostring(made).." eggs spawned: "..tostring(rows).." rows, "..tostring(cols).." per row."
+            if en=="MIXED" then spawnStatus.Text=spawnStatus.Text.." "..tostring(typeCount or 0).." egg types." end
             if appliedScale and appliedScale<EggSize then spawnStatus.Text=spawnStatus.Text.." Scale fitted to "..tostring(appliedScale).." to stay inside the map." end
             spawnStatus.TextColor3=C.green
             notice(P.UserId,Display,": spawned",tostring(made).." EGGS","")
@@ -3675,7 +3728,7 @@ clearEggBtn.MouseButton1Click:Connect(function() local n=clearSpawnedEggs(); spa
 
 -- mixed layout page from the reference screenshots
 local patternDescriptions={
-    ["ORIGINAL 6x20"]="20 eggs across; a six-type sequence repeats through each row.",
+    ["ORIGINAL 6x20"]="Fill the playable floor with a continuous mix of every available egg type.",
     ["ONE TYPE PER ROW"]="Every egg in one row is the same type; the next row changes type.",
     ["SPLIT ROWS 3+3"]="Three of one type, then three of the next type, repeating across the row.",
     ["PAIRS 2+2+2"]="Two of type A, two of type B, two of type C, repeating across the row.",
