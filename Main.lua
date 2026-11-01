@@ -1528,20 +1528,78 @@ function cloneWholeEgg(source)
     return clone
 end
 
+-- Capture a posed assembly in one fresh model. Nested model scale/pivot
+-- caches must never be reapplied independently to the shell and ornaments.
+function staticEggSnapshot(clone)
+    local origin=clone:IsA("Model") and clone:GetPivot() or clone.CFrame
+    local model=Instance.new("Model")
+    model.Name=clone.Name
+    model.WorldPivot=CFrame.new()
+    local nodes=clone:IsA("BasePart") and {clone} or clone:GetDescendants()
+    for _,part in ipairs(nodes) do
+        if part:IsA("BasePart") then
+            part.CFrame=origin:ToObjectSpace(part.CFrame)
+            part.Parent=model
+        end
+        eggWorkYield()
+    end
+    for _,node in ipairs(nodes) do
+        if (node:IsA("Beam") or node:IsA("Trail") or node:IsA("Light") or node:IsA("ParticleEmitter"))
+            and not node:IsDescendantOf(model) then node.Parent=model end
+    end
+    if clone~=model and not clone:IsDescendantOf(model) then clone:Destroy() end
+    return model
+end
+
+-- A valid egg needs a visible central body, not just horns, a nest or a halo.
+function completeEggBody(model)
+    local cf,size=eggVisualBounds(model)
+    if not cf or size.Y<.1 then return false end
+    local covered={false,false,false,false,false}
+    local coreX=size.X*.18
+    local coreZ=size.Z*.18
+    for _,part in ipairs(model:GetDescendants()) do
+        if part:IsA("BasePart") and part.Transparency<.95 then
+            local localPos=cf:PointToObjectSpace(part.Position)
+            local half=part.Size/2
+            if math.abs(localPos.X)<=coreX+half.X and math.abs(localPos.Z)<=coreZ+half.Z then
+                for i,fraction in ipairs({-.30,-.15,0,.15,.30}) do
+                    if math.abs(localPos.Y-size.Y*fraction)<=half.Y then covered[i]=true end
+                end
+            end
+        end
+        eggWorkYield()
+    end
+    local count=0
+    for _,present in ipairs(covered) do if present then count=count+1 end end
+    return count>=4
+end
+
+function completeEggFallback(name)
+    local env=(getgenv and getgenv()) or _G
+    local factory=env.SAE_COMPLETE_EGG_FACTORY
+    if type(factory)~="function" then return nil end
+    local ok,model=pcall(factory,name)
+    return ok and model or nil
+end
+
 function templateInfo(name)
     local cached=EggTemplateCache[name]
     if cached then return cached end
 
     local source=findEgg(name)
-    if not source then
-        return nil
+    local clone=source and cloneWholeEgg(source) or nil
+    if clone then
+        clone=staticEggSnapshot(clone)
+        stripEggTemplate(clone)
+        if not completeEggBody(clone) then clone:Destroy(); clone=nil end
     end
-
-    local clone=cloneWholeEgg(source)
+    if not clone then
+        clone=completeEggFallback(name)
+        if clone then clone=staticEggSnapshot(clone); stripEggTemplate(clone) end
+    end
     if not clone then return nil end
-
     clone.Name=name
-    stripEggTemplate(clone)
 
     local root=rootOf(clone)
     if not root then
@@ -1581,8 +1639,8 @@ end
 function availableEggs()
     local available,seen={},{}
     local function add(name,source)
-        if source and not seen[source] and templateInfo(name) then
-            seen[source]=true
+        if (not source or not seen[source]) and templateInfo(name) then
+            if source then seen[source]=true end
             table.insert(available,name)
         end
     end
@@ -2451,6 +2509,7 @@ local function spawnEggs(name,count,size,pattern,customCF,batchTag,onProgress)
         return prepared
     end
 
+    local spawnSlice=os.clock()
     local made=0
     local lastCols=0
     local lastRows=0
@@ -2510,7 +2569,10 @@ local function spawnEggs(name,count,size,pattern,customCF,batchTag,onProgress)
         end
         if not placed then break end
         if onProgress and (made==1 or made%5==0 or made==count) then onProgress(made,count) end
-        task.wait()
+        if i%8==0 or os.clock()-spawnSlice>=.003 then
+            task.wait()
+            spawnSlice=os.clock()
+        end
     end
     for _,prepared in pairs(batchTemplates) do prepared.template:Destroy() end
 
@@ -6040,6 +6102,16 @@ local function model(cat,name)
         preparedModels[key]=entry
     end
     return entry.template:Clone(),entry.exact
+end
+
+-- Reuse existing complete reference geometry when a live spawn asset is
+-- an unassembled effect prefab. Do not invent replacement meshes.
+E.SAE_COMPLETE_EGG_FACTORY=function(requested)
+    local key=norm(requested):gsub("egg$","")
+    for name in pairs(EGG_DESIGNS) do
+        if norm(name):gsub("egg$","")==key then return model("Eggs",name) end
+    end
+    return nil
 end
 
 -- Cinematic parcels use isolated clones of the same 3D inventory models.
