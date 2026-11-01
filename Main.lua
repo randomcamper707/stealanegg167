@@ -2111,6 +2111,19 @@ end
 
 local function physicalLayout(count,sizeValue,baseCF,bounds,pattern,footprintX,footprintZ)
     local scale=math.clamp(sizeValue,25,500)/100
+    if pattern=="FIXED FIVE" then
+        local cols=math.min(5,count)
+        local rows=math.ceil(count/cols)
+        local x=math.max(.1,footprintX or 30)
+        local z=math.max(.1,footprintZ or 30)
+        local width=math.max(0,((bounds and bounds.X) or 0)-.5)
+        local depth=math.max(0,((bounds and bounds.Z) or 0)-4)
+        local sx=cols>1 and (width-x)/(cols-1) or 0
+        local sz=z+math.max(.2,z*.01)
+        -- Egg decorations can interleave slightly; never reduce the visible size.
+        local fits=width>=x and (cols==1 or sx>=x*.72) and (rows-1)*sz+z<=depth
+        return cols,rows,sx,sz,fits
+    end
     local cols
     if pattern=="ORIGINAL 6x20" then
         cols=20
@@ -2431,6 +2444,7 @@ end
 -- Horizontal wall tests are essential: a large floor can continue OUTSIDE walls.
 local function eggWallDistance(origin,direction,distance)
     local nearest=distance
+    local nearestWall=nil
     for _,height in ipairs({3,10}) do
         local rp=RaycastParams.new()
         rp.FilterType=Enum.RaycastFilterType.Exclude
@@ -2451,16 +2465,45 @@ local function eggWallDistance(origin,direction,distance)
                     or (span>=18 and span/thickness>=4))
             end
             if wall and (not hit.Normal or math.abs(hit.Normal.Y)<.6) then
-                nearest=math.min(nearest,hit.Distance or (hit.Position-origin-Vector3.new(0,height,0)).Magnitude)
+                local gap=hit.Distance or (hit.Position-origin-Vector3.new(0,height,0)).Magnitude
+                if gap<nearest then nearest=gap;nearestWall=part end
                 break
             end
             if not part then break end
             table.insert(excluded,part)
         end
     end
-    return nearest
+    return nearest,nearestWall
+end
+local function eggCorridorFrame(startFrame)
+    local base=startFrame.Position
+    local bestAxis=nil
+    local bestScore=0
+    for i=0,7 do
+        local angle=i*math.pi/4
+        local gap,wall=eggWallDistance(base,Vector3.new(math.cos(angle),0,math.sin(angle)),512)
+        if wall and wall:IsA("BasePart") then
+            local span=math.max(wall.Size.X,wall.Size.Z)
+            local axis=wall.Size.X>wall.Size.Z and wall.CFrame.RightVector or wall.CFrame.LookVector
+            axis=Vector3.new(axis.X,0,axis.Z)
+            local score=span/math.max(24,gap)
+            if axis.Magnitude>.5 and score>bestScore then bestScore=score;bestAxis=axis.Unit end
+        end
+    end
+    if not bestAxis then
+        local hit=groundHitNear(base,nil)
+        local floor=hit and hit.Instance
+        if floor and floor:IsA("BasePart") and math.max(floor.Size.X,floor.Size.Z)>=math.min(floor.Size.X,floor.Size.Z)*1.5 then
+            local axis=floor.Size.X>floor.Size.Z and floor.CFrame.RightVector or floor.CFrame.LookVector
+            bestAxis=Vector3.new(axis.X,0,axis.Z).Unit
+        end
+    end
+    bestAxis=bestAxis or startFrame.LookVector
+    if bestAxis:Dot(startFrame.LookVector)<0 then bestAxis=-bestAxis end
+    return CFrame.lookAt(base,base+bestAxis)
 end
 local function playerEggRegion(startFrame,requiredDepth)
+    startFrame=eggCorridorFrame(startFrame)
     local base=startFrame.Position
     local forward=startFrame.LookVector
     local right=startFrame.RightVector
@@ -2523,6 +2566,7 @@ local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgres
     count=math.min(count,availableSlots)
     size=math.clamp(tonumber(size) or 300,25,500)
     pattern=pattern or PATTERNS[1]
+    if startFrame then size=300;pattern="FIXED FIVE" end
 
     -- Compare normalized visible sizes, never raw mixed-asset dimensions.
     -- Every species uses the same visible span for a given slider value.
@@ -2534,10 +2578,10 @@ local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgres
         local sz=inf and inf.size or nil
         if sz then
             local nativeSpan=math.max(sz.X,sz.Y,sz.Z,.01)
-            local r=footprintFrame and footprintFrame.RightVector or Vector3.new(1,0,0)
-            local f=footprintFrame and footprintFrame.LookVector or Vector3.new(0,0,-1)
-            baseFootX=math.max(baseFootX,(math.abs(r.X)*sz.X+math.abs(r.Z)*sz.Z)*10/nativeSpan)
-            baseFootZ=math.max(baseFootZ,(math.abs(f.X)*sz.X+math.abs(f.Z)*sz.Z)*10/nativeSpan)
+            -- Egg models turn with the corridor, so neither size nor footprint
+            -- depends on the angle the player was facing when clicking.
+            baseFootX=math.max(baseFootX,sz.X*10/nativeSpan)
+            baseFootZ=math.max(baseFootZ,sz.Z*10/nativeSpan)
         end
     end
     if name=="MIXED" then
@@ -2551,7 +2595,7 @@ local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgres
 
     if onProgress then onProgress(0,count,"Checking the floor and walls...") end
     local baseCF,bounds
-    if startFrame then baseCF,bounds=playerEggRegion(startFrame,math.ceil(count/3)*(footprintZ+1)+4) else baseCF,bounds=visibleSpawnFrame(customCF,count,pattern,size) end
+    if startFrame then baseCF,bounds=playerEggRegion(startFrame,math.ceil(count/5)*(footprintZ+1)+4) else baseCF,bounds=visibleSpawnFrame(customCF,count,pattern,size) end
     if not baseCF or not bounds then return false,"No usable floor ahead. Face along the corridor and try again." end
     local baseY=eggGroundHeight(baseCF.Position,baseCF.Position.Y)
     local forward=Vector3.new(baseCF.LookVector.X,0,baseCF.LookVector.Z)
@@ -2564,6 +2608,12 @@ local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgres
     if mix then for _,en in ipairs(mix) do includeFootprint(en) end else includeFootprint(name) end
     footprintX=baseFootX*visualScale; footprintZ=baseFootZ*visualScale
 
+    if startFrame then
+        local fits=select(5,physicalLayout(count,size,baseCF,bounds,pattern,footprintX,footprintZ))
+        if not fits then
+            return false,"This stretch is too narrow or short for 100 large eggs in five columns. Use a wider, longer stretch; egg size will stay large."
+        end
+    else
     -- Avoid dropping a whole column because of a tiny spacing remainder.
     -- A uniform adjustment of at most 6% lets four large eggs fill a lane
     -- that is only slightly narrower than four native footprints.
@@ -2598,6 +2648,8 @@ local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgres
         footprintZ=baseFootZ*visualScale
     end
 
+    end
+
     -- Keep the dense field at the near end of the usable floor; do not
     -- distribute a small batch over thousands of studs of empty corridor.
     local _,fieldRows,_,rowSpacing=physicalLayout(count,size,baseCF,bounds,pattern,footprintX,footprintZ)
@@ -2617,6 +2669,26 @@ local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgres
         local wanted=batchPosition(i)
         groundHeights[i]=eggGroundHeight(wanted,baseY)
         if i%25==0 then task.wait() end
+    end
+
+    if startFrame then
+        -- Validate the complete outside edges, not only the egg centres.
+        local _,rows=physicalLayout(count,size,baseCF,bounds,pattern,footprintX,footprintZ)
+        local halfWidth=(bounds.X-.5)/2
+        for row=0,rows-1 do
+            local centre=(baseCF*CFrame.new(0,0,-(footprintZ/2+2+row*(footprintZ+math.max(.2,footprintZ*.01))))).Position
+            for _,z in ipairs({-1,1}) do
+                local edge=centre+baseCF.LookVector*(z*footprintZ/2)
+                for _,side in ipairs({-1,1}) do
+                    local corner=edge+baseCF.RightVector*(side*halfWidth)
+                    if not eggGroundHeight(corner,baseY,true)
+                        or eggWallDistance(edge,baseCF.RightVector*side,halfWidth+.1)<halfWidth then
+                        return false,"The outside edge of this five-column batch would cross a wall or missing floor. Choose a clear stretch; egg size will stay large."
+                    end
+                end
+            end
+            if row%5==0 then eggWorkYield() end
+        end
     end
 
     if beforePlacement then beforePlacement() end
@@ -2674,11 +2746,12 @@ local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgres
                     local placement=wanted
                     if rowCols>1 and (col==0 or col==rowCols-1) then
                         local r=baseCF.RightVector
-                        local visibleWidth=(math.abs(r.X)*info.size.X+math.abs(r.Z)*info.size.Z)*prepared.scale
+                        local visibleWidth=info.size.X*prepared.scale
                         local side=col==0 and -1 or 1
                         placement=placement+r*(side*math.max(0,footprintX-visibleWidth)/2)
                     end
-                    pivot(egg,CFrame.new(placement.X+offset.X,(groundHeights[i] or baseY)+offset.Y,placement.Z+offset.Z))
+                    local floorPosition=Vector3.new(placement.X,groundHeights[i] or baseY,placement.Z)
+                    pivot(egg,CFrame.lookAt(floorPosition,floorPosition+baseCF.LookVector)*CFrame.new(offset))
                     egg.Parent=EggFolder
                     registerEgg(egg,en,prepared.scale)
                     if not EggState[egg] then error("Egg has no usable pickup root") end
@@ -4211,8 +4284,8 @@ section(EggsPage,"BATCH",36)
 local amountLabel=label(EggsPage,"100 eggs per batch",UDim2.fromOffset(5,58),UDim2.new(1,-10,0,26),12)
 amountLabel.TextColor3=C.muted
 
-local sizeValue=function() return EggSize end
-sizeValue=intSlider(EggsPage,92,25,500,5,300,"Egg scale",function(v) EggSize=v end)
+local fixedSizeLabel=label(EggsPage,"Large eggs · 5 per row · 20 rows",UDim2.fromOffset(5,96),UDim2.new(1,-10,0,28),12)
+fixedSizeLabel.TextColor3=C.purple2
 local spawnBtn=button(EggsPage,"Spawn mixed eggs",UDim2.fromOffset(4,148),UDim2.new(.5,-8,0,34),false)
 local clearEggBtn=button(EggsPage,"Clear eggs",UDim2.new(.5,4,0,148),UDim2.new(.5,-8,0,34),true)
 local spawnStatus=label(EggsPage,"Starts at your position and continues forward.",UDim2.fromOffset(5,190),UDim2.new(1,-10,0,36),11)
