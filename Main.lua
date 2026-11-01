@@ -925,14 +925,13 @@ CFG = {
     }
 }
 
+-- Bounded, complete reference models only; no live effect-prefab discovery.
+local DEFAULT_EGG_COUNT=50
 EGGS = {
-    "MIXED","Skeleton Horse","World Burner","Equinox egg","Aetheron egg",
-    "Gorilla King egg","Nightflame egg","Eternal Lunar Dragon egg","Unicorn egg",
-    "Nibbles #013 Egg","Experiment #001 Egg","Scorched Dragon egg","Drilla egg",
-    "Void Dragon egg","Rifborn egg","Riftbeasts egg","Shattered Rift egg",
-    "Pegasus","ArchAngel","Oni Tiger egg","Kitsune egg"
+    "MIXED","Unicorn Egg","Kitsune Egg","Night Flame Egg","Archangel Egg",
+    "World Burner Egg","Aetheron Egg","Cthulhu Egg","Luminous Cthulhu Egg",
+    "Sabertooth Egg","Skeletal Sabertooth Egg","Octophant Egg","Mecha Scrambler Egg"
 }
-local QTY = {200,250,300,350,400,450,500}
 PATTERNS = {"ORIGINAL 6x20","ONE TYPE PER ROW","SPLIT ROWS 3+3","PAIRS 2+2+2","MIRRORED ROWS","ALTERNATING ROWS","DIAGONAL SEQUENCE"}
 ALIAS = {
     ["Skeleton Horse"]={"Skeleton Horse","Skeleton Horse Egg","SkeletonHorse","SkeletonHorseEgg"},
@@ -1534,6 +1533,7 @@ function staticEggSnapshot(clone)
     local origin=clone:IsA("Model") and clone:GetPivot() or clone.CFrame
     local model=Instance.new("Model")
     model.Name=clone.Name
+    for key,value in pairs(clone:GetAttributes()) do model:SetAttribute(key,value) end
     model.WorldPivot=CFrame.new()
     local nodes=clone:IsA("BasePart") and {clone} or clone:GetDescendants()
     for _,part in ipairs(nodes) do
@@ -1587,18 +1587,12 @@ function templateInfo(name)
     local cached=EggTemplateCache[name]
     if cached then return cached end
 
-    local source=findEgg(name)
-    local clone=source and cloneWholeEgg(source) or nil
-    if clone then
-        clone=staticEggSnapshot(clone)
-        stripEggTemplate(clone)
-        if not completeEggBody(clone) then clone:Destroy(); clone=nil end
-    end
-    if not clone then
-        clone=completeEggFallback(name)
-        if clone then clone=staticEggSnapshot(clone); stripEggTemplate(clone) end
-    end
+    -- Only use the script's closed, static reference geometry. Quantity
+    -- limits cannot repair an incomplete live prefab.
+    local clone=completeEggFallback(name)
     if not clone then return nil end
+    clone=staticEggSnapshot(clone)
+    stripEggTemplate(clone)
     clone.Name=name
 
     local root=rootOf(clone)
@@ -1637,26 +1631,9 @@ function templateInfo(name)
 end
 
 function availableEggs()
-    local available,seen={},{}
-    local function add(name,source)
-        if (not source or not seen[source]) and templateInfo(name) then
-            if source then seen[source]=true end
-            table.insert(available,name)
-        end
-    end
-    for i=2,arrlen(EGGS) do add(EGGS[i],findEgg(EGGS[i])) end
-    for _,source in ipairs(eggAssetIndex().sources) do
-        if source.Parent and not seen[source] then
-            local name=source:GetAttribute("EggName") or source.Name
-            local n=norm(name)
-            if n~="egg" and n~="eggs" and n~="eggshell" and n~="eggnest" and n~="eggbase"
-                and n~="eggfx" and n~="eggvfx" and n~="eggstand" and n~="eggpart"
-                and n:find("egg",1,true) and not eggAssetCollection(source)
-                and (not EggCache[name] or EggCache[name]==source) then
-                EggCache[name]=source
-                add(name,source)
-            end
-        end
+    local available={}
+    for i=2,arrlen(EGGS) do
+        if templateInfo(EGGS[i]) then table.insert(available,EGGS[i]) end
         eggWorkYield()
     end
     return available
@@ -2415,19 +2392,25 @@ function eggGroundHeight(pos,referenceY)
     return referenceY
 end
 
-local function spawnEggs(name,count,size,pattern,customCF,batchTag,onProgress)
+local EggBatchBusy=false
+local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgress)
     local mix=nil
     if name=="MIXED" then
         mix=availableEggs()
         print("[Egg spawner] Mixed egg names: "..table.concat(mix,", "))
         if arrlen(mix)==0 then
-            return false,"None of the configured egg visuals are replicated to this client."
+            return false,"The complete egg models are still preparing. Try again in a moment."
         end
     elseif not templateInfo(name) then
         return false,name.." visual is not replicated to this client."
     end
 
-    count=math.clamp(tonumber(count) or 1,1,500)
+    count=math.clamp(math.floor(tonumber(count) or DEFAULT_EGG_COUNT),1,DEFAULT_EGG_COUNT)
+    local active=0
+    for egg in pairs(EggState) do if egg.Parent then active=active+1 end end
+    local availableSlots=DEFAULT_EGG_COUNT-active
+    if availableSlots<=0 then return false,"The 50-egg limit is reached. Clear the current eggs before spawning more." end
+    count=math.min(count,availableSlots)
     size=math.clamp(tonumber(size) or 300,25,500)
     pattern=pattern or PATTERNS[1]
 
@@ -2590,6 +2573,15 @@ local function spawnEggs(name,count,size,pattern,customCF,batchTag,onProgress)
     local typeCount=0
     for _ in pairs(usedTypes) do typeCount=typeCount+1 end
     return true,made,lastCols,lastRows,0,size,typeCount
+end
+
+local function spawnEggs(...)
+    if EggBatchBusy then return false,"An egg batch is already spawning." end
+    EggBatchBusy=true
+    local result=table.pack(pcall(buildEggBatch,...))
+    EggBatchBusy=false
+    if not result[1] then return false,"Could not prepare the egg batch: "..tostring(result[2]) end
+    return table.unpack(result,2,result.n)
 end
 
 local function clearSpawnedEggs(batchTag)
@@ -3303,7 +3295,7 @@ local function sammyBatchCenter()
 end
 
 local function spawnSammyBatch(refillOnly)
-    local target=240
+    local target=DEFAULT_EGG_COUNT
     if not refillOnly then clearSpawnedEggs("SAMMY240") end
 
     local cf=sammyBatchCenter()
@@ -3311,18 +3303,18 @@ local function spawnSammyBatch(refillOnly)
         local current=countBatch("SAMMY240")
         local need=math.max(0,target-current)
         if need<=0 then
-            return true,"Sammy batch: 240 / 240 eggs."
+            return true,"Sammy batch: 50 / 50 eggs."
         end
 
         local ok,msg=spawnEggs("MIXED",need,200,"DIAGONAL SEQUENCE",cf,"SAMMY240")
         if not ok and attempt==3 then
-            return false,"Sammy batch stopped at "..tostring(countBatch("SAMMY240")).." / 240. "..tostring(msg)
+            return false,"Sammy batch stopped at "..tostring(countBatch("SAMMY240")).." / 50. "..tostring(msg)
         end
         task.wait()
     end
 
     local final=countBatch("SAMMY240")
-    return final>=target, final>=target and "Sammy batch: 240 / 240 eggs." or ("Sammy batch: "..tostring(final).." / 240 eggs.")
+    return final>=target, final>=target and "Sammy batch: 50 / 50 eggs." or ("Sammy batch: "..tostring(final).." / 50 eggs.")
 end
 
 local function markSammySpot()
@@ -3346,7 +3338,7 @@ end
 task.spawn(function()
     while Gui.Parent do
         task.wait(1)
-        if SammyAutoRefill and countBatch("SAMMY240")<=190 then
+        if SammyAutoRefill and countBatch("SAMMY240")<=40 then
             spawnSammyBatch(true)
         end
     end
@@ -3800,7 +3792,7 @@ end
 
 -- MAIN navigation and reference-style pages.
 local EggIndex=1
-local Amount=200
+local Amount=DEFAULT_EGG_COUNT
 local EggSize=300
 local Pattern=PATTERNS[1]
 
@@ -3959,19 +3951,9 @@ mixedBtn.MouseButton1Click:Connect(function() EggIndex=1; selectedEggLabel.Text=
 local patternBtn=button(EggsPage,"Layout: ORIGINAL 6x20",UDim2.fromOffset(4,64),UDim2.new(1,-8,0,30),true)
 patternBtn.MouseButton1Click:Connect(function() showAdminPage("Mixed egg layouts",true) end)
 
-section(EggsPage,"QUANTITY",101)
-local amountValues={200,250,300,350,400,450,500}
-local amountButtons={}
-for i,v in ipairs(amountValues) do
-    local value=v
-    local b=button(EggsPage,tostring(value),UDim2.new((i-1)/7,3,0,124),UDim2.new(1/7,-6,0,26),true)
-    amountButtons[value]=b
-    b.MouseButton1Click:Connect(function()
-        Amount=value
-        for k,x in pairs(amountButtons) do x:SetAttribute("RestingColor",(k==Amount) and C.purple or C.card2) end
-    end)
-end
-amountButtons[200]:SetAttribute("RestingColor",C.purple)
+section(EggsPage,"BATCH",101)
+local amountLabel=label(EggsPage,"50 eggs per batch",UDim2.fromOffset(5,124),UDim2.new(1,-10,0,26),12)
+amountLabel.TextColor3=C.muted
 
 local sizeValue=function() return EggSize end
 sizeValue=intSlider(EggsPage,158,25,500,5,300,"Egg scale",function(v) EggSize=v end)
@@ -3981,13 +3963,13 @@ local spawnStatus=label(EggsPage,"Spawns eggs behind you, facing your direction.
 spawnStatus.TextWrapped=true; spawnStatus.TextColor3=C.muted
 local EggSpawnBusy=false
 spawnBtn.MouseButton1Click:Connect(function()
-    if EggSpawnBusy then return end
+    if EggSpawnBusy or EggBatchBusy then return end
     EggSpawnBusy=true
     local ok,err=pcall(function()
     spawnBtn.Text="SPAWNING..."
     local en=EGGS[EggIndex]
-    -- Each click is one clean batch, so choosing 500 means exactly 500 GENERAL eggs.
-    clearSpawnedEggs("GENERAL")
+    -- Each click is one clean batch, so the default batch contains at most 50 eggs in total.
+    clearSpawnedEggs()
     if callRemote("SpawnEggs",{Egg=en,Quantity=Amount,Size=EggSize,Pattern=Pattern,BehindPlayer=true}) then
         spawnStatus.Text="Server spawn request sent."
         spawnStatus.TextColor3=C.green
@@ -4491,13 +4473,13 @@ BotAvatarPage.CanvasSize=UDim2.fromOffset(0,275)
 
 -- Sammy tab, closely matching the reference panel.
 local sy=0
-local sammyHeader=label(BotSammyPage,"SAMMY S7 - 240 MIXED EGGS / 2x",UDim2.fromOffset(5,sy),UDim2.new(1,-16,0,26),11); sammyHeader.Font=Enum.Font.GothamBold; sy=sy+32
+local sammyHeader=label(BotSammyPage,"SAMMY S7 - 50 MIXED EGGS / 2x",UDim2.fromOffset(5,sy),UDim2.new(1,-16,0,26),11); sammyHeader.Font=Enum.Font.GothamBold; sy=sy+32
 local spawnSammyButton=button(BotSammyPage,"Spawn Sammy",UDim2.fromOffset(0,sy),UDim2.new(1,-6,0,38),false); sy=sy+45
 local markSpotButton=button(BotSammyPage,"Mark this spot",UDim2.fromOffset(0,sy),UDim2.new(1,-6,0,34),true); sy=sy+38
 local spotStatus=label(BotSammyPage,"No spot marked. Uses the map center.",UDim2.fromOffset(5,sy),UDim2.new(1,-16,0,32),9); spotStatus.TextColor3=C.muted; spotStatus.TextWrapped=true; sy=sy+37
-local sammyEggButton=button(BotSammyPage,"Spawn 240 eggs / refill empty spots",UDim2.fromOffset(0,sy),UDim2.new(1,-6,0,38),false); sy=sy+45
+local sammyEggButton=button(BotSammyPage,"Spawn 50 eggs / refill empty spots",UDim2.fromOffset(0,sy),UDim2.new(1,-6,0,38),false); sy=sy+45
 local clearSammyEggs=button(BotSammyPage,"CLEAR SAMMY EGGS",UDim2.fromOffset(0,sy),UDim2.new(1,-6,0,35),true); clearSammyEggs:SetAttribute("RestingColor",Color3.fromRGB(120,30,68)); sy=sy+42
-local autoRefillBtn=button(BotSammyPage,"AUTO REFILL: OFF - after 50 gone",UDim2.fromOffset(0,sy),UDim2.new(1,-6,0,34),true); sy=sy+41
+local autoRefillBtn=button(BotSammyPage,"AUTO REFILL: OFF - after 10 gone",UDim2.fromOffset(0,sy),UDim2.new(1,-6,0,34),true); sy=sy+41
 local testBannerBtn=button(BotSammyPage,"Test banner",UDim2.fromOffset(0,sy),UDim2.new(.5,-8,0,33),true)
 local advertiseBtn=button(BotSammyPage,"ADVERTISE: OFF",UDim2.new(.5,3,0,sy),UDim2.new(.5,-9,0,33),true); sy=sy+42
 local sammyDirect=textbox(BotSammyPage,"This box always announces as Sammy",UDim2.fromOffset(0,sy),UDim2.new(1,-6,0,42),""); sy=sy+48
@@ -4517,7 +4499,7 @@ spawnSammyButton.MouseButton1Click:Connect(function() if callRemote("SpawnSammy"
 markSpotButton.MouseButton1Click:Connect(function() local ok,msg=markSammySpot(); spotStatus.Text=msg; spotStatus.TextColor3=ok and C.green or C.red end)
 sammyEggButton.MouseButton1Click:Connect(function() local ok,msg=spawnSammyBatch(countBatch("SAMMY240")>0); sammyPanelStatus.Text=msg; sammyPanelStatus.TextColor3=ok and C.green or C.red end)
 clearSammyEggs.MouseButton1Click:Connect(function() local n=clearSpawnedEggs("SAMMY240"); sammyPanelStatus.Text="Cleared "..n.." Sammy egg(s)."; sammyPanelStatus.TextColor3=C.green end)
-autoRefillBtn.MouseButton1Click:Connect(function() SammyAutoRefill=not SammyAutoRefill; autoRefillBtn.Text=SammyAutoRefill and "AUTO REFILL: ON - after 50 gone" or "AUTO REFILL: OFF - after 50 gone"; autoRefillBtn:SetAttribute("RestingColor",SammyAutoRefill and C.purple or C.card2) end)
+autoRefillBtn.MouseButton1Click:Connect(function() SammyAutoRefill=not SammyAutoRefill; autoRefillBtn.Text=SammyAutoRefill and "AUTO REFILL: ON - after 10 gone" or "AUTO REFILL: OFF - after 10 gone"; autoRefillBtn:SetAttribute("RestingColor",SammyAutoRefill and C.purple or C.card2) end)
 testBannerBtn.MouseButton1Click:Connect(function() sammyBanner(SammyMessages[1] or "Sammy test banner") end)
 advertiseBtn.MouseButton1Click:Connect(function() SammyAdvertise=not SammyAdvertise; advertiseBtn.Text=SammyAdvertise and "ADVERTISE: ON" or "ADVERTISE: OFF"; advertiseBtn:SetAttribute("RestingColor",SammyAdvertise and C.purple or C.card2) end)
 sammyDirect.FocusLost:Connect(function(enter) if enter and sammyDirect.Text~="" then sammyBanner(sammyDirect.Text); sammyDirect.Text="" end end)
