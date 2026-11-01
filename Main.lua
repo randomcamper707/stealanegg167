@@ -1343,25 +1343,56 @@ function usableEggSource(o,container)
     return nil
 end
 
+-- Require egg identity as well as the species name. Pet aliases overlap the
+-- original egg list, so first-match descendant order is not a safe asset choice.
+function eggSourceScore(source,container)
+    if not source or source==EggFolder or source==NPCFolder
+        or source:IsDescendantOf(EggFolder) or source:IsDescendantOf(NPCFolder) then return nil end
+    local score=0
+    local cur=source
+    while cur and cur~=container do
+        local n=norm(cur.Name)
+        if cur==P.Character or cur:FindFirstChildOfClass("Humanoid")
+            or n=="pets" or n=="pet" or n=="petmodels" or n=="petassets"
+            or n=="pettemplates" or n=="petinventory" then return nil end
+        if cur==source and n:find("egg",1,true) then score=score+100 end
+        if n=="egg" or n=="eggs" or n=="eggmodels" or n=="eggassets"
+            or n=="eggtemplates" or n=="eggspawns" or n=="spawneggs" then
+            score=score+50
+        end
+        cur=cur.Parent
+    end
+    -- An untyped model called "Unicorn" may be a pet. Never substitute it.
+    return score>0 and score or nil
+end
+
 function findEgg(name)
     local cached=EggCache[name]
-    if cached and cached.Parent then return cached end
+    if cached and cached.Parent then
+        for _,container in ipairs({ReplicatedStorage,workspace}) do
+            if cached:IsDescendantOf(container) and eggSourceScore(cached,container) then return cached end
+        end
+        EggCache[name]=nil
+    end
 
     local want={}
     for _,a in ipairs(ALIAS[name] or {name}) do want[norm(a)]=true end
-
+    local best,bestScore=nil,-1
     for _,container in ipairs({ReplicatedStorage,workspace}) do
         for _,o in ipairs(container:GetDescendants()) do
             if not o:IsDescendantOf(EggFolder) and matchObj(o,want) then
                 local source=usableEggSource(o,container)
-                if source then
-                    EggCache[name]=source
-                    return source
+                local score=eggSourceScore(source,container)
+                if score then
+                    if want[norm(o.Name)] then score=score+20 end
+                    if container==ReplicatedStorage then score=score+5 end
+                    if score>bestScore then best,bestScore=source,score end
                 end
             end
         end
     end
-    return nil
+    EggCache[name]=best
+    return best
 end
 
 -- Build a stripped visual template from the REAL egg object already replicated by the game.
@@ -1393,17 +1424,15 @@ end
 
 function templateInfo(name)
     local cached=EggTemplateCache[name]
-    if cached~=nil then return cached or nil end
+    if cached then return cached end
 
     local source=findEgg(name)
     if not source then
-        EggTemplateCache[name]=false
         return nil
     end
 
     local ok,clone=pcall(function() return source:Clone() end)
     if not ok or not clone then
-        EggTemplateCache[name]=false
         return nil
     end
 
@@ -1413,7 +1442,6 @@ function templateInfo(name)
     local root=rootOf(clone)
     if not root then
         pcall(function() clone:Destroy() end)
-        EggTemplateCache[name]=false
         return nil
     end
 
@@ -1426,7 +1454,6 @@ function templateInfo(name)
         end)
         if not okBox or not cf or not sz or sz.Magnitude<.1 or math.max(sz.X,sz.Y,sz.Z)>80 then
             pcall(function() clone:Destroy() end)
-            EggTemplateCache[name]=false
             return nil
         end
         info.bottomOffset=cf.Position.Y-sz.Y/2
@@ -1435,7 +1462,6 @@ function templateInfo(name)
         clone.CFrame=CFrame.new()
         if clone.Size.Magnitude<.1 or math.max(clone.Size.X,clone.Size.Y,clone.Size.Z)>80 then
             pcall(function() clone:Destroy() end)
-            EggTemplateCache[name]=false
             return nil
         end
         info.bottomOffset=-clone.Size.Y/2
