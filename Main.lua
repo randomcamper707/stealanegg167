@@ -1441,7 +1441,9 @@ EggTemplateCache={}
 
 function stripEggTemplate(o)
     local remove={}
-    for _,x in ipairs(o:GetDescendants()) do
+    local nodes={o}
+    for _,x in ipairs(o:GetDescendants()) do table.insert(nodes,x) end
+    for _,x in ipairs(nodes) do
         eggWorkYield()
         if x:IsA("Script") or x:IsA("LocalScript") or x:IsA("ModuleScript")
             or x:IsA("ProximityPrompt") or x:IsA("ClickDetector")
@@ -1449,7 +1451,12 @@ function stripEggTemplate(o)
             or x:IsA("Sound")
             or x:IsA("BodyMover") or x:IsA("Constraint") then
             table.insert(remove,x)
-        elseif x:IsA("ParticleEmitter") or x:IsA("Trail") or x:IsA("Beam") or x:IsA("Light") then
+        elseif x:IsA("Beam") then
+            -- Beams can form the egg's actual shell. Keep structural beams
+            -- visible; only ambient particles, trails and lights use distance limits.
+            x:SetAttribute("SAE_EffectEnabled",false)
+            x.Segments=math.min(x.Segments,8)
+        elseif x:IsA("ParticleEmitter") or x:IsA("Trail") or x:IsA("Light") then
             x:SetAttribute("SAE_EffectEnabled",x.Enabled)
             x.Enabled=false
             if x:IsA("ParticleEmitter") then
@@ -1461,6 +1468,7 @@ function stripEggTemplate(o)
                 x.Shadows=false
             end
         elseif x:IsA("BasePart") then
+            x.LocalTransparencyModifier=0
             x.Anchored=true
             x.CanCollide=false
             x.CanTouch=false
@@ -2349,7 +2357,7 @@ function eggGroundHeight(pos,referenceY)
     return referenceY
 end
 
-local function spawnEggs(name,count,size,pattern,customCF,batchTag)
+local function spawnEggs(name,count,size,pattern,customCF,batchTag,onProgress)
     local mix=nil
     if name=="MIXED" then
         mix=availableEggs()
@@ -2446,40 +2454,80 @@ local function spawnEggs(name,count,size,pattern,customCF,batchTag)
     local made=0
     local lastCols=0
     local lastRows=0
+    local failedTypes={}
+    local spawned={}
+    local usedTypes={}
+    local lastError=nil
 
     for i=1,count do
         local wanted,row,col,cols,rows,_,_,rowCols=layoutPosition(i,count,size,baseCF,bounds,pattern,footprintX,footprintZ)
         lastCols=cols
         lastRows=rows
-
-        local en=name
-        if name=="MIXED" then en=mixedEggFor(pattern,mix,row,col,i,rowCols or cols) end
-
-        local info=en and templateInfo(en) or nil
-        if info then
-            local ok=pcall(function()
-                local prepared=preparedEgg(en,info)
-                if not prepared then return end
-                local egg=prepared.template:Clone()
-                egg.Name=en
-                if batchTag then egg:SetAttribute("SAE_Batch",batchTag) end
-                local offset=prepared.offset
-                pivot(egg,CFrame.new(wanted.X+offset.X,(groundHeights[i] or baseY)+offset.Y,wanted.Z+offset.Z))
-                -- Parent only once the clone is ready; effects are already disabled.
-                egg.Parent=EggFolder
-                registerEgg(egg,en,prepared.scale)
-                made=made+1
-            end)
+        local preferred=name
+        if name=="MIXED" then preferred=mixedEggFor(pattern,mix,row,col,i,rowCols or cols) end
+        local candidates={preferred}
+        if mix then
+            for _,alternative in ipairs(mix) do
+                if alternative~=preferred then table.insert(candidates,alternative) end
+            end
         end
-
+        local placed=false
+        for _,en in ipairs(candidates) do
+            if not failedTypes[en] then
+                local egg=nil
+                local ok,err=pcall(function()
+                    local info=templateInfo(en)
+                    if not info then error("No complete visual for "..tostring(en)) end
+                    local prepared=preparedEgg(en,info)
+                    if not prepared then error("Cannot prepare "..tostring(en)) end
+                    egg=prepared.template:Clone()
+                    if not egg then error("Cannot clone "..tostring(en)) end
+                    egg.Name=en
+                    if batchTag then egg:SetAttribute("SAE_Batch",batchTag) end
+                    local offset=prepared.offset
+                    pivot(egg,CFrame.new(wanted.X+offset.X,(groundHeights[i] or baseY)+offset.Y,wanted.Z+offset.Z))
+                    egg.Parent=EggFolder
+                    registerEgg(egg,en,prepared.scale)
+                    if not EggState[egg] then error("Egg has no usable pickup root") end
+                end)
+                if ok then
+                    made=made+1
+                    usedTypes[en]=true
+                    table.insert(spawned,egg)
+                    placed=true
+                    break
+                end
+                lastError=err
+                failedTypes[en]=true
+                warn("[Egg spawner] Skipped incomplete visual "..tostring(en)..": "..tostring(err))
+                if egg then
+                    local r=rootOf(egg)
+                    if r then EggByRoot[r]=nil end
+                    EggState[egg]=nil
+                    egg:Destroy()
+                end
+            end
+        end
+        if not placed then break end
+        if onProgress and (made==1 or made%5==0 or made==count) then onProgress(made,count) end
         task.wait()
     end
     for _,prepared in pairs(batchTemplates) do prepared.template:Destroy() end
 
-    if made<=0 then
-        return false,"The game egg visuals were found, but none could be cloned."
+    if made~=count then
+        -- Never leave a partly filled field that looks like intentional gaps.
+        for _,egg in ipairs(spawned) do
+            local r=rootOf(egg)
+            if r then EggByRoot[r]=nil end
+            EggState[egg]=nil
+            egg:Destroy()
+            task.wait()
+        end
+        return false,"Could not create a complete egg batch: "..tostring(lastError or "missing visual")
     end
-    return true,made,lastCols,lastRows,0,size,mix and arrlen(mix) or 1
+    local typeCount=0
+    for _ in pairs(usedTypes) do typeCount=typeCount+1 end
+    return true,made,lastCols,lastRows,0,size,typeCount
 end
 
 local function clearSpawnedEggs(batchTag)
@@ -3882,7 +3930,9 @@ spawnBtn.MouseButton1Click:Connect(function()
         spawnStatus.Text="Server spawn request sent."
         spawnStatus.TextColor3=C.green
     else
-        local ok,made,cols,rows,fallbacks,appliedScale,typeCount=spawnEggs(en,Amount,EggSize,Pattern,nil,"GENERAL")
+        local ok,made,cols,rows,fallbacks,appliedScale,typeCount=spawnEggs(en,Amount,EggSize,Pattern,nil,"GENERAL",function(done,total)
+            spawnStatus.Text="Spawning eggs: "..tostring(done).." / "..tostring(total)
+        end)
         if ok then
             spawnStatus.Text=tostring(made).." eggs spawned: "..tostring(rows).." rows, "..tostring(cols).." per row."
             if en=="MIXED" then spawnStatus.Text=spawnStatus.Text.." "..tostring(typeCount or 0).." egg types." end
