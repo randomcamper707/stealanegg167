@@ -3637,8 +3637,11 @@ end)
 local function objPos(o) if not o then return nil end; if o:IsA("BasePart") then return o.Position elseif o:IsA("Model") then return o:GetPivot().Position end end
 local function safePosition() if SafeObj and SafeObj.Parent then local p=objPos(SafeObj); if p then local hit=groundHitNear(p,nil); SafePos=hit and hit.Position or p end end; return SafePos end
 local function marker()
-    if Marker then Marker:Destroy(); Marker=nil end; local p=safePosition(); if not p then return end; local x=Instance.new("Part"); x.Name="SAE_SafeZoneMarker"; x.Size=Vector3.new(8,.08,8); x.Anchored=true; x.CanCollide=false; x.CanTouch=false; x.CanQuery=false; x.Material=Enum.Material.Neon; x.Color=Color3.fromRGB(80,255,120); x.Transparency=.82; x.Position=p+Vector3.new(0,.08,0); x.Parent=workspace; Marker=x
+    if Marker then Marker:Destroy();Marker=nil end
+    local old=workspace:FindFirstChild("SAE_SafeZoneMarker")
+    if old then old:Destroy() end
 end
+marker()
 detectSafe=function()
     local pr=P.Character and P.Character:FindFirstChild("HumanoidRootPart"); local pp=pr and pr.Position or Vector3.zero; local best=nil; local score=-1e9
     for _,o in ipairs(workspace:GetDescendants()) do
@@ -3663,6 +3666,7 @@ local COLLECTOR_AVATARS={
     "Nikilis","badcc"
 }
 local BotAvatarDescriptions={}
+local BotAvatarModels={}
 local BotAvatarUsed={}
 local BotAvatarLooks={}
 local CollectorAvatarSerial=0
@@ -3757,7 +3761,11 @@ local function botAvatar(i)
                 look=table.concat(signature,"|")
                 if BotAvatarLooks[look] then return nil end
                 BotAvatarLooks[look]=sequence;reservedLook=true
-                return Players:CreateHumanoidModelFromDescription(description,Enum.HumanoidRigType.R15)
+                local template=BotAvatarModels[name]
+                if template then return template:Clone() end
+                local avatar=Players:CreateHumanoidModelFromDescription(description,Enum.HumanoidRigType.R15)
+                if avatar then BotAvatarModels[name]=avatar:Clone() end
+                return avatar
             end)
             if ok and model then
                 BotAvatarUsed[name]=sequence
@@ -3897,9 +3905,22 @@ local function nearestEgg(pos,key,blocked)
 end
 
 local CollectorGeneration=0
+local CollectorOrigin=nil
+local CollectorDirection=Vector3.new(0,0,-1)
+local CollectorSlots=2
+local CollectorPending=0
+local CollectorPendingSlots={}
+local CollectorReady={}
+local function clearReadyCollectors()
+    for _,model in ipairs(CollectorReady) do model:Destroy() end
+    CollectorReady={}
+end
 local function clearBots()
     CollectorGeneration=CollectorGeneration+1
     CollectorsEnabled=false
+    CollectorPending=0
+    CollectorPendingSlots={}
+    clearReadyCollectors()
     for _,b in ipairs(Bots) do
         if b.model and b.model.Parent then b.model:Destroy() end
     end
@@ -3911,6 +3932,7 @@ end
 
 local function stopCollectors()
     CollectorsEnabled=false
+    clearReadyCollectors()
     for _,d in ipairs(Bots) do
         d.returning=true
         d.returnStarted=nil
@@ -3918,9 +3940,13 @@ local function stopCollectors()
 end
 
 local botBrain
+local requestCollector
 local function createCollector(home,direction,slot,generation)
     if generation~=CollectorGeneration or not CollectorsEnabled then return nil end
-    local ok,m=pcall(function() return botAvatar(slot) end)
+    local ok,m=pcall(function()
+        local ready=table.remove(CollectorReady,1)
+        return ready or botAvatar(slot)
+    end)
     if not ok or not m then return nil end
     if generation~=CollectorGeneration or not CollectorsEnabled then m:Destroy();return nil end
     local h=m:FindFirstChildOfClass("Humanoid")
@@ -3948,6 +3974,64 @@ local function createCollector(home,direction,slot,generation)
     return d
 end
 
+requestCollector=function(slot,generation)
+    if generation~=CollectorGeneration or not CollectorsEnabled then return end
+    -- Returning carriers can overlap outbound collectors, with a generous
+    -- upper bound to avoid runaway models if movement becomes blocked.
+    if #Bots+CollectorPending>=CollectorSlots*4+8 or CollectorPendingSlots[slot] then return end
+    CollectorPending=CollectorPending+1
+    CollectorPendingSlots[slot]=true
+    task.spawn(function()
+        local right=Vector3.new(-CollectorDirection.Z,0,CollectorDirection.X)
+        local row=math.floor((slot-1)/4)
+        local col=(slot-1)%4
+        local home=CollectorOrigin+right*((col-1.5)*3.4)-CollectorDirection*(row*3.2)
+        pcall(function() createCollector(home,CollectorDirection,slot,generation) end)
+        if generation==CollectorGeneration then
+            CollectorPending=math.max(0,CollectorPending-1)
+            CollectorPendingSlots[slot]=nil
+        end
+    end)
+end
+
+local function startCollectorStream(generation)
+    -- Prepare a few different avatars ahead of pickup, rather than making
+    -- the next departure wait for a remote avatar load.
+    for _=1,2 do
+        task.spawn(function()
+            while generation==CollectorGeneration and CollectorsEnabled do
+                if #CollectorReady<math.min(6,CollectorSlots+1) then
+                    local ok,model=pcall(function() return botAvatar(0) end)
+                    if ok and model then
+                        if generation==CollectorGeneration and CollectorsEnabled then
+                            table.insert(CollectorReady,model)
+                        else model:Destroy() end
+                    end
+                end
+                task.wait(.05)
+            end
+        end)
+    end
+    task.spawn(function()
+        while generation==CollectorGeneration and CollectorsEnabled do
+            local outbound=0
+            local usedSlots={}
+            for _,d in ipairs(Bots) do
+                if d.model and d.model.Parent and not d.inbound and not d.replacing and not d.returning then
+                    outbound=outbound+1
+                    usedSlots[d.slot]=true
+                end
+            end
+            local needed=math.max(0,CollectorSlots-outbound-CollectorPending)
+            for slot=1,CollectorSlots do
+                if needed<=0 then break end
+                if not usedSlots[slot] and not CollectorPendingSlots[slot] then requestCollector(slot,generation);needed=needed-1 end
+            end
+            task.wait(.05)
+        end
+    end)
+end
+
 botBrain=function(d)
     task.spawn(function()
         local target=nil
@@ -3970,7 +4054,7 @@ botBrain=function(d)
                     EggState[target].claimTime=nil
                 end
                 target=nil
-                local home=d.home or safePosition() or r.Position
+                local home=d.home or CollectorOrigin or r.Position
                 if not d.returnStarted then
                     d.returnStarted=os.clock()
                     d.returnTimeout=math.max(8,horizontalDistance(r.Position,home)/math.max(d.speed,1)+5)
@@ -3983,17 +4067,13 @@ botBrain=function(d)
                     if carried and carried.Parent then dropEgg(carried,home,true) end
                     carried=nil
                     if d.trail then d.trail.Enabled=false end
-                    if d.replacing and not d.returning and CollectorsEnabled then
-                        -- Select the successor while this appearance is still reserved.
-                        createCollector(home,d.homeDirection or Vector3.new(0,0,-1),d.slot,d.generation)
-                    end
                     m:Destroy()
                     local index=table.find(Bots,d)
                     if index then table.remove(Bots,index) end
                     break
                 end
             elseif carried and carried.Parent then
-                local sp=safePosition()
+                local sp=CollectorOrigin or d.home
                 if sp then
                     moveCollector(d,h,r,sp)
                     if horizontalDistance(r.Position,sp)<=10 then
@@ -4035,6 +4115,10 @@ botBrain=function(d)
                         if hd<=12 then
                             if carryEgg(target,r,d.key,m) then
                                 carried=target
+                                d.inbound=true
+                                -- Dispatch immediately at pickup, while this collector
+                                -- is still on its return trip.
+                                requestCollector(d.slot,d.generation)
                                 target=nil
                                 lastDistance=nil
                             else
@@ -4071,35 +4155,22 @@ botBrain=function(d)
 end
 
 local function spawnBots(n)
-    if not safePosition() then detectSafe() end
-    local safe=safePosition()
-    if not safe then return false,"Lock the safe zone first." end
-
+    local root=P.Character and P.Character:FindFirstChild("HumanoidRootPart")
+    if not root then return false,"Wait for your character to load." end
+    local hit=groundHitNear(root.Position,P.Character)
+    local origin=hit and hit.Position or root.Position
     clearBots()
-    BotAvatarUsed={}
-    BotAvatarLooks={}
+    BotAvatarUsed={};BotAvatarLooks={}
+    CollectorOrigin=origin
+    CollectorSlots=math.clamp(n,1,10)
+    local nearest=nearestEgg(origin,"BOT_SPAWN_LOOK")
+    local target=nearest and eggPickupPosition(nearest)
+    local dir=target and (target-origin) or root.CFrame.LookVector
+    dir=Vector3.new(dir.X,0,dir.Z)
+    CollectorDirection=dir.Magnitude>.1 and dir.Unit or Vector3.new(0,0,-1)
     CollectorsEnabled=true
-    n=math.clamp(n,1,10)
-    local eggTarget=nil
-    local nearest=nearestEgg(safe,"BOT_SPAWN_LOOK")
-    local nearestPosition=nearest and eggPickupPosition(nearest) or nil
-    if nearestPosition then eggTarget=nearestPosition end
-    if not eggTarget then eggTarget=select(1,getMapFrame()).Position end
-
-    local dir=Vector3.new(eggTarget.X-safe.X,0,eggTarget.Z-safe.Z)
-    if dir.Magnitude<.1 then dir=Vector3.new(0,0,-1) else dir=dir.Unit end
-    local right=Vector3.new(-dir.Z,0,dir.X)
-
-    local generation=CollectorGeneration
-    for i=1,n do
-        if generation~=CollectorGeneration or not CollectorsEnabled then break end
-        local row=math.floor((i-1)/4)
-        local col=(i-1)%4
-        local spawnPos=safe+right*((col-1.5)*3.4)-dir*(row*3.2)
-        createCollector(spawnPos,dir,i,generation)
-        task.wait(.04)
-    end
-    return true,tostring(arrlen(Bots)).." bots spawned from Safe Zone: "..SafeName
+    startCollectorStream(CollectorGeneration)
+    return true,"Collectors running continuously."
 end
 
 -- Reference-script style boost/event controls. Without a configured legitimate server remote,
@@ -4812,28 +4883,21 @@ local function showBotPage(n) for k,p in pairs(BotPages) do p.Visible=(k==n) end
 for i,n in ipairs({"Collectors","Avatar","Sammy"}) do local b=button(BotTabs,n,UDim2.new((i-1)/3,3*(i-1),0,0),UDim2.new(1/3,-6,0,32),true); BotTabButtons[n]=b; b.MouseButton1Click:Connect(function() showBotPage(n) end) end
 
 -- Collectors tab
-local SafeCard=card(CollectorsPage,UDim2.fromOffset(0,0),UDim2.new(1,-6,0,111)); section(SafeCard,"SAFE ZONE",7)
-local collectorSafeStatus=label(SafeCard,"NOT LOCKED",UDim2.fromOffset(10,29),UDim2.new(1,-20,0,20),10); collectorSafeStatus.Font=Enum.Font.GothamBold; collectorSafeStatus.TextColor3=C.orange
-local setSafe=button(SafeCard,"SET HERE",UDim2.fromOffset(10,61),UDim2.new(1,-20,0,34),true)
-local function refreshSafeUI() if safePosition() then collectorSafeStatus.Text="LOCKED - "..SafeName; collectorSafeStatus.TextColor3=C.green else collectorSafeStatus.Text="NOT LOCKED"; collectorSafeStatus.TextColor3=C.orange end end
-setSafe.MouseButton1Click:Connect(function() local ok,msg=setSafeHere(); refreshSafeUI(); if not ok then collectorSafeStatus.Text=msg; collectorSafeStatus.TextColor3=C.red end end)
 local NPCCount=2
-local WaveDelay=5
-intSlider(CollectorsPage,125,1,10,1,2,"NPCS PER WAVE",function(v) NPCCount=v end)
-intSlider(CollectorsPage,180,1,15,1,5,"WAVE DELAY (SEC)",function(v) WaveDelay=v end)
-local collectorsToggle=button(CollectorsPage,"COLLECTORS: OFF",UDim2.fromOffset(0,238),UDim2.new(1,-6,0,38),true)
-local clearNPCBtn=button(CollectorsPage,"Stop / clear NPCs",UDim2.fromOffset(0,283),UDim2.new(1,-6,0,36),true)
-local collectorInfo=label(CollectorsPage,"Eggs: 0 | NPCs: 0",UDim2.fromOffset(5,326),UDim2.new(1,-16,0,28),9); collectorInfo.TextColor3=C.muted
+intSlider(CollectorsPage,8,1,10,1,2,"OUTBOUND COLLECTORS",function(v) NPCCount=v end)
+local collectorsToggle=button(CollectorsPage,"COLLECTORS: OFF",UDim2.fromOffset(0,72),UDim2.new(1,-6,0,38),true)
+local clearNPCBtn=button(CollectorsPage,"Stop / clear NPCs",UDim2.fromOffset(0,117),UDim2.new(1,-6,0,36),true)
+local collectorInfo=label(CollectorsPage,"Eggs: 0 | NPCs: 0",UDim2.fromOffset(5,160),UDim2.new(1,-16,0,28),9); collectorInfo.TextColor3=C.muted
 collectorsToggle.MouseButton1Click:Connect(function()
     if CollectorsEnabled then
         stopCollectors(); collectorInfo.Text="Collectors are returning home."; collectorInfo.TextColor3=C.muted; collectorsToggle.Text="COLLECTORS: OFF"; collectorsToggle:SetAttribute("RestingColor",C.card2)
     else
         if arrlen(Bots)==0 or Bots[1].returning then local ok,msg=spawnBots(NPCCount); if not ok then collectorInfo.Text=msg; collectorInfo.TextColor3=C.red; return end else CollectorsEnabled=true end
-        collectorsToggle.Text="COLLECTORS: ON"; collectorsToggle:SetAttribute("RestingColor",C.purple); collectorInfo.Text="Collectors bring eggs to the safe zone."; collectorInfo.TextColor3=C.green
+        collectorsToggle.Text="COLLECTORS: ON"; collectorsToggle:SetAttribute("RestingColor",C.purple); collectorInfo.Text="Collectors depart continuously; the next leaves at pickup."; collectorInfo.TextColor3=C.green
     end
 end)
 clearNPCBtn.MouseButton1Click:Connect(function() clearBots(); collectorsToggle.Text="COLLECTORS: OFF"; collectorsToggle:SetAttribute("RestingColor",C.card2); collectorInfo.Text="NPCs cleared."; collectorInfo.TextColor3=C.muted end)
-CollectorsPage.CanvasSize=UDim2.fromOffset(0,366)
+CollectorsPage.CanvasSize=UDim2.fromOffset(0,204)
 
 task.spawn(function()
     while Gui.Parent do
@@ -4856,7 +4920,7 @@ local av2=label(avatarCard,"Random trail per bot: ON",UDim2.fromOffset(12,68),UD
 local av3=label(avatarCard,"Displayed speed stat: 200M - 270M",UDim2.fromOffset(12,99),UDim2.new(1,-24,0,22),11); av3.TextColor3=C.green
 local refreshBots=button(avatarCard,"Refresh collector avatars",UDim2.fromOffset(10,139),UDim2.new(1,-20,0,39),false)
 local avatarStatus=label(BotAvatarPage,"Refresh to spawn collectors with new avatars.",UDim2.fromOffset(5,211),UDim2.new(1,-16,0,50),9); avatarStatus.TextWrapped=true; avatarStatus.TextColor3=C.muted
-refreshBots.MouseButton1Click:Connect(function() if not safePosition() then avatarStatus.Text="Lock the safe zone first."; avatarStatus.TextColor3=C.orange; return end; local ok,msg=spawnBots(NPCCount); avatarStatus.Text=msg; avatarStatus.TextColor3=ok and C.green or C.red; if ok then CollectorsEnabled=true; collectorsToggle.Text="COLLECTORS: ON"; collectorsToggle:SetAttribute("RestingColor",C.purple) end end)
+refreshBots.MouseButton1Click:Connect(function() local ok,msg=spawnBots(NPCCount); avatarStatus.Text=msg; avatarStatus.TextColor3=ok and C.green or C.red; if ok then CollectorsEnabled=true; collectorsToggle.Text="COLLECTORS: ON"; collectorsToggle:SetAttribute("RestingColor",C.purple) end end)
 BotAvatarPage.CanvasSize=UDim2.fromOffset(0,275)
 
 -- Sammy tab, closely matching the reference panel.
@@ -4905,7 +4969,6 @@ msg1.MouseButton1Click:Connect(function() sendSammyAd(1) end)
 msg2.MouseButton1Click:Connect(function() sendSammyAd(2) end)
 msg3.MouseButton1Click:Connect(function() sendSammyAd(3) end)
 showBotPage("Collectors")
-refreshSafeUI()
 
 
 end
