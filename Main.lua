@@ -4073,7 +4073,7 @@ botBrain=function(d)
                     break
                 end
             elseif carried and carried.Parent then
-                local sp=CollectorOrigin or d.home
+                local sp=safePosition() or CollectorOrigin or d.home
                 if sp then
                     moveCollector(d,h,r,sp)
                     if horizontalDistance(r.Position,sp)<=10 then
@@ -4157,8 +4157,13 @@ end
 local function spawnBots(n)
     local root=P.Character and P.Character:FindFirstChild("HumanoidRootPart")
     if not root then return false,"Wait for your character to load." end
-    local hit=groundHitNear(root.Position,P.Character)
-    local origin=hit and hit.Position or root.Position
+    local origin=safePosition()
+    if not origin then
+        local ok,message=detectSafe()
+        if not ok then return false,message end
+        origin=safePosition()
+    end
+    if not origin then return false,"The map's collector return area is not available yet." end
     clearBots()
     BotAvatarUsed={};BotAvatarLooks={}
     CollectorOrigin=origin
