@@ -1836,9 +1836,12 @@ function templateInfo(name)
     return info
 end
 
+local EggCatalogCache=nil
 local EggCatalogBusy=false
 function availableEggs()
+    if EggCatalogCache then return EggCatalogCache end
     while EggCatalogBusy do task.wait() end
+    if EggCatalogCache then return EggCatalogCache end
     EggCatalogBusy=true
     local ok,result=pcall(function()
     local available,seen={},{}
@@ -1857,6 +1860,7 @@ function availableEggs()
     end)
     EggCatalogBusy=false
     if not ok then error(result) end
+    if #result>0 then EggCatalogCache=result end
     return result
 end
 
@@ -2493,13 +2497,78 @@ PickupPrompt.RequiresLineOfSight=false
 PickupPrompt.Enabled=false
 
 local ActiveEggEffects={}
+-- Prepare complete originals off-screen, never on the render path of a Spawn click.
+local ReadyEggTemplates={}
+local ReadyEggCopies={}
+local ReadyEggDetails=setmetatable({},{__mode="k"})
+local EggWarmBusy=false
+local function preparedEggTemplate(name,info,size)
+    local key=name..":"..tostring(size)
+    local prepared=ReadyEggTemplates[key]
+    if prepared then return prepared end
+    local template=info.template:Clone()
+    local scale=scaleEgg(template,size,info.size)
+    local offset=Vector3.new(-info.centerOffset.X*scale,-info.bottomOffset*scale,-info.centerOffset.Z*scale)
+    pivot(template,CFrame.new(offset))
+    prepared={template=template,offset=offset,scale=scale}
+    ReadyEggTemplates[key]=prepared
+    return prepared
+end
+local function cacheReadyEgg(egg)
+    local effects={}
+    for _,object in ipairs(egg:GetDescendants()) do
+        if object:GetAttribute("SAE_EffectEnabled")==true then effects[#effects+1]=object end
+    end
+    ReadyEggDetails[egg]={root=rootOf(egg),effects=effects}
+end
+local function takeReadyEgg(name,prepared,size)
+    local copies=ReadyEggCopies[name..":"..tostring(size)]
+    local egg=copies and table.remove(copies)
+    return egg or prepared.template:Clone()
+end
+local function warmEggBatch()
+    if EggWarmBusy then return end
+    EggWarmBusy=true
+    task.spawn(function()
+        local ok,err=pcall(function()
+            local names=availableEggs()
+            if #names==0 then return end
+            for i,name in ipairs(names) do
+                if not Gui.Parent then return end
+                local info=templateInfo(name)
+                local prepared=preparedEggTemplate(name,info,300)
+                local key=name..":300"
+                local copies=ReadyEggCopies[key] or {};ReadyEggCopies[key]=copies
+                local needed=math.floor(DEFAULT_EGG_COUNT/#names)+(i<=DEFAULT_EGG_COUNT%#names and 1 or 0)
+                while #copies<needed and Gui.Parent do
+                    local egg=prepared.template:Clone()
+                    cacheReadyEgg(egg)
+                    copies[#copies+1]=egg
+                    eggWorkYield()
+                end
+            end
+        end)
+        EggWarmBusy=false
+        if not ok then warn("[SAE] Egg preparation: "..tostring(err)) end
+    end)
+end
+Gui.Destroying:Connect(function()
+    for _,copies in pairs(ReadyEggCopies) do for _,egg in ipairs(copies) do egg:Destroy() end end
+    for _,prepared in pairs(ReadyEggTemplates) do prepared.template:Destroy() end
+    ReadyEggCopies={};ReadyEggTemplates={}
+end)
+
 local function registerEgg(egg,name,scale)
     local r=rootOf(egg)
     if not r then return end
-    local effects={}
-    for _,x in ipairs(egg:GetDescendants()) do
-        if x:GetAttribute("SAE_EffectEnabled")==true then table.insert(effects,x) end
+    local details=ReadyEggDetails[egg]
+    local effects=details and details.effects or {}
+    if not details then
+        for _,x in ipairs(egg:GetDescendants()) do
+            if x:GetAttribute("SAE_EffectEnabled")==true then table.insert(effects,x) end
+        end
     end
+    ReadyEggDetails[egg]=nil
     EggState[egg]={name=name,scale=scale,root=r,effects=effects,prompt=nil,carried=false,delivered=false,claim=nil}
     EggByRoot[r]=egg
 end
@@ -2780,11 +2849,7 @@ local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgres
     end
 
     count=math.clamp(math.floor(tonumber(count) or DEFAULT_EGG_COUNT),1,DEFAULT_EGG_COUNT)
-    local active=0
-    if not beforePlacement then for egg in pairs(EggState) do if egg.Parent then active=active+1 end end end
-    local availableSlots=DEFAULT_EGG_COUNT-active
-    if availableSlots<=0 then return false,"The 100-egg limit is reached. Clear the current eggs before spawning more." end
-    count=math.min(count,availableSlots)
+    -- Quantity is per click; existing eggs survive until Clear or collection.
     size=math.clamp(tonumber(size) or 300,25,500)
     pattern=pattern or PATTERNS[1]
     if startFrame then size=300;pattern="FIXED FIVE" end
@@ -2889,7 +2954,6 @@ local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgres
     for i=1,count do
         local wanted=batchPosition(i)
         groundHeights[i]=eggGroundHeight(wanted,baseY)
-        if i%25==0 then task.wait() end
     end
 
     if startFrame then
@@ -2914,20 +2978,7 @@ local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgres
 
     if beforePlacement then beforePlacement() end
 
-    -- Scale and measure each distinct species once, not every placed copy.
-    local batchTemplates={}
-    local function preparedEgg(en,info)
-        if batchTemplates[en] then return batchTemplates[en] end
-        local template=info.template:Clone()
-        local scale=scaleEgg(template,size,info.size)
-        -- templateInfo already measured the complete native geometry. Scaling
-        -- its cached offsets is exact and avoids walking every part again.
-        local offset=Vector3.new(-info.centerOffset.X*scale,-info.bottomOffset*scale,-info.centerOffset.Z*scale)
-        pivot(template,CFrame.new(offset))
-        local prepared={template=template,offset=offset,scale=scale}
-        batchTemplates[en]=prepared
-        return prepared
-    end
+    local function preparedEgg(en,info) return preparedEggTemplate(en,info,size) end
 
     local mixedOrder=mix and shuffledEggOrder(mix,count) or nil
     local spawnSlice=os.clock()
@@ -2960,7 +3011,7 @@ local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgres
                     if not info then error("No complete visual for "..tostring(en)) end
                     local prepared=preparedEgg(en,info)
                     if not prepared then error("Cannot prepare "..tostring(en)) end
-                    egg=prepared.template:Clone()
+                    egg=takeReadyEgg(en,prepared,size)
                     if not egg then error("Cannot clone "..tostring(en)) end
                     egg.Name=en
                     if batchTag then egg:SetAttribute("SAE_Batch",batchTag) end
@@ -3004,7 +3055,7 @@ local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgres
             spawnSlice=os.clock()
         end
     end
-    for _,prepared in pairs(batchTemplates) do prepared.template:Destroy() end
+    task.defer(warmEggBatch)
 
     if made~=count then
         -- Never leave a partly filled field that looks like intentional gaps.
@@ -3701,7 +3752,12 @@ local function placeNPC(m,pos,dir)
     local h=m:FindFirstChildOfClass("Humanoid")
     if not r or not h then return end
     local hit=groundHitNear(pos,m)
-    local y=hit and hit.Position.Y+h.HipHeight+r.Size.Y/2 or pos.Y
+    local height=h.HipHeight+r.Size.Y/2
+    if h.RigType==Enum.HumanoidRigType.R6 then
+        local leg=m:FindFirstChild("Left Leg") or m:FindFirstChild("Right Leg")
+        height=height+(leg and leg.Size.Y or 2)
+    end
+    local y=(hit and hit.Position.Y or pos.Y)+height
     local d=Vector3.new(dir.X,0,dir.Z)
     if d.Magnitude<.1 then d=Vector3.new(0,0,-1) else d=d.Unit end
     m:PivotTo(CFrame.lookAt(Vector3.new(pos.X,y,pos.Z),Vector3.new(pos.X,y,pos.Z)+d))
@@ -3743,8 +3799,8 @@ local function sammyBatchCenter()
 end
 
 local function spawnSammyBatch(refillOnly)
-    local target=DEFAULT_EGG_COUNT
-    if not refillOnly then clearSpawnedEggs("SAMMY240") end
+    local target=refillOnly and DEFAULT_EGG_COUNT or (countBatch("SAMMY240")+DEFAULT_EGG_COUNT)
+    -- Spawning never clears an existing batch.
 
     local cf,bounds=sammyBatchCenter()
     -- Convert the measured field centre to its near end, then use the same
@@ -3836,130 +3892,52 @@ local Bots={}
 -- Collector bots are generated locally and do NOT depend on how many real
 -- players are in the server. Selecting 1-10 always attempts that exact count.
 -- Explicit public avatar sources, independent of server players and friends.
+-- Twelve real accounts, in a strict cycle. Preserve their actual full avatar builds.
 local COLLECTOR_AVATARS={
-    "Stickmasterluke","asimo3089","Cindering","Dued1","BereZaa",
-    "Loleris","Merely","Seranok","CloneTrooper1019","TheGamer101",
-    "Nikilis","badcc"
+    "Stickmasterluke","asimo3089","Cindering","Dued1","BereZaa","Loleris",
+    "Merely","Seranok","CloneTrooper1019","TheGamer101","Nikilis","badcc"
 }
-local BotAvatarDescriptions={}
 local BotAvatarModels={}
-local BotAvatarUsed={}
-local BotAvatarLooks={}
+local BotAvatarLoading={}
 local CollectorAvatarSerial=0
-local function dressCollectorFallback(model,i)
-    local head=model:FindFirstChild("Head")
-    local torso=model:FindFirstChild("UpperTorso") or model:FindFirstChild("Torso")
-    if not head or not torso then return end
-    local palettes={
-        Color3.fromRGB(170,70,255),Color3.fromRGB(0,210,220),Color3.fromRGB(255,160,35),
-        Color3.fromRGB(255,65,100),Color3.fromRGB(80,230,110)
-    }
-    local accent=palettes[((i-1)%#palettes)+1]
-    local function piece(name,body,size,offset,color,neon)
-        local part=Instance.new("Part")
-        part.Name=name; part.Size=size; part.CFrame=body.CFrame*offset
-        part.Color=color; part.Material=neon and Enum.Material.Neon or Enum.Material.SmoothPlastic
-        part.Anchored=false; part.CanCollide=false; part.CanTouch=false; part.CanQuery=false; part.Massless=true
-        part.Parent=model
-        local weld=Instance.new("WeldConstraint");weld.Part0=body;weld.Part1=part;weld.Parent=part
-        return part
-    end
-    local dark=Color3.fromRGB(28,30,42)
-    piece("CollectorHelmet",head,Vector3.new(2.15,.55,1.3),CFrame.new(0,.55,0),dark)
-    piece("CollectorVisor",head,Vector3.new(1.85,.4,.15),CFrame.new(0,.05,-.66),accent,true)
-    piece("CollectorPack",torso,Vector3.new(1.6,1.7,.65),CFrame.new(0,0,.85),dark)
-    piece("CollectorPackLight",torso,Vector3.new(.35,1.2,.12),CFrame.new(0,0,1.2),accent,true)
-    if i%3==0 then
-        for _,side in ipairs({-1,1}) do piece("CollectorEarpiece",head,Vector3.new(.35,1.1,.5),CFrame.new(side*1.1,.45,0),accent) end
-    elseif i%3==1 then
-        piece("CollectorAntenna",head,Vector3.new(.16,.9,.16),CFrame.new(.6,1.2,0),accent,true)
-    else
-        piece("CollectorCrest",head,Vector3.new(.3,.8,1.25),CFrame.new(0,1,0),accent)
-    end
-end
-local function fallbackBot(i)
-    -- Start with separate classic outfits, rather than recoloring the same avatar.
-    local outfits={
-        {{245,205,48},{13,105,172},{75,151,75}},
-        {{234,184,146},{151,0,0},{27,42,53}},
-        {{204,142,105},{98,37,209},{242,243,243}},
-        {{124,92,70},{0,143,156},{51,88,130}},
-        {{255,219,172},{255,176,0},{91,93,105}},
-        {{163,162,165},{27,42,53},{196,40,28}},
-        {{86,66,54},{242,243,243},{49,107,13}},
-        {{255,204,153},{255,102,204},{72,54,105}},
-        {{218,179,142},{33,84,185},{44,101,29}},
-        {{105,64,40},{218,133,65},{17,17,17}}
-    }
-    local style=outfits[((i-1)%#outfits)+1]
-    local d=Instance.new("HumanoidDescription")
-    d.HeadColor=Color3.fromRGB(unpack(style[1]))
-    d.LeftArmColor=d.HeadColor; d.RightArmColor=d.HeadColor
-    d.TorsoColor=Color3.fromRGB(unpack(style[2]))
-    d.LeftLegColor=Color3.fromRGB(unpack(style[3])); d.RightLegColor=d.LeftLegColor
-    d.HeightScale=.92+((i-1)%4)*.06
-    d.WidthScale=.8+((i-1)%3)*.12
-    d.DepthScale=d.WidthScale
-    d.BodyTypeScale=((i-1)%3)*.45
-    d.ProportionScale=((i-1)%2)*.8
-    local ok,model=pcall(function() return Players:CreateHumanoidModelFromDescription(d,Enum.HumanoidRigType.R15) end)
-    d:Destroy()
-    if ok and model then dressCollectorFallback(model,i); return model end
-    return nil
-end
-
-local function botAvatar(i)
-    CollectorAvatarSerial=CollectorAvatarSerial+1
-    local sequence=CollectorAvatarSerial
-    for offset=0,#COLLECTOR_AVATARS-1 do
-        local name=COLLECTOR_AVATARS[((sequence-1+offset)%#COLLECTOR_AVATARS)+1]
-        if not BotAvatarUsed[name] then
-            BotAvatarUsed[name]=sequence
-            local look=nil
-            local reservedLook=false
-            local ok,model=pcall(function()
-                local description=BotAvatarDescriptions[name]
-                if not description then
-                    local id=Players:GetUserIdFromNameAsync(name)
-                    description=Players:GetHumanoidDescriptionFromUserId(id)
-                    -- Skip unloaded/default outfits instead of repeating blank bodies.
-                    local dressed=description.Shirt>0 or description.Pants>0
-                    for _,field in ipairs({"HatAccessory","HairAccessory","FaceAccessory","BackAccessory","FrontAccessory","ShouldersAccessory"}) do
-                        if description[field]~="" then dressed=true end
-                    end
-                    if not dressed then return nil end
-                    BotAvatarDescriptions[name]=description
-                end
-                local signature={tostring(description.Shirt),tostring(description.Pants),tostring(description.Face)}
-                for _,field in ipairs({"HatAccessory","HairAccessory","FaceAccessory","BackAccessory","FrontAccessory","ShouldersAccessory","WaistAccessory"}) do
-                    table.insert(signature,tostring(description[field]))
-                end
-                look=table.concat(signature,"|")
-                if BotAvatarLooks[look] then return nil end
-                BotAvatarLooks[look]=sequence;reservedLook=true
-                local template=BotAvatarModels[name]
-                if template then return template:Clone() end
-                local avatar=Players:CreateHumanoidModelFromDescription(description,Enum.HumanoidRigType.R15)
-                if avatar then BotAvatarModels[name]=avatar:Clone() end
-                return avatar
-            end)
-            if ok and model then
-                BotAvatarUsed[name]=sequence
-                BotAvatarLooks[look]=sequence
-                model:SetAttribute("CollectorAvatarSource",name)
-                model:SetAttribute("CollectorAppearanceSequence",sequence)
-                model.Destroying:Connect(function()
-                    if BotAvatarUsed[name]==sequence then BotAvatarUsed[name]=nil end
-                    if BotAvatarLooks[look]==sequence then BotAvatarLooks[look]=nil end
-                end)
-                return model
+local CollectorAvatarCursor=0
+local function botAvatar(_)
+    if not Gui.Parent then return nil end
+    CollectorAvatarCursor=CollectorAvatarCursor%#COLLECTOR_AVATARS+1
+    local name=COLLECTOR_AVATARS[CollectorAvatarCursor]
+    while BotAvatarLoading[name] and Gui.Parent do task.wait(.05) end
+    if not Gui.Parent then return nil end
+    local template=BotAvatarModels[name]
+    if not template then
+        BotAvatarLoading[name]=true
+        local ok,result=pcall(function()
+            local userId=Players:GetUserIdFromNameAsync(name)
+            local avatar=createAvatar(userId)
+            if not avatar or not avatar:FindFirstChildOfClass("Humanoid") or not avatar:FindFirstChild("HumanoidRootPart") then
+                if avatar then avatar:Destroy() end
+                error("Incomplete avatar: "..name)
             end
-            if BotAvatarUsed[name]==sequence then BotAvatarUsed[name]=nil end
-            if reservedLook and BotAvatarLooks[look]==sequence then BotAvatarLooks[look]=nil end
-        end
+            for _,object in ipairs(avatar:GetDescendants()) do
+                if object:IsA("Script") or object:IsA("LocalScript") or object:IsA("Tool") then object:Destroy()
+                elseif object:IsA("BasePart") then
+                    object.AssemblyLinearVelocity=Vector3.zero;object.AssemblyAngularVelocity=Vector3.zero
+                    if object.Parent:IsA("Accessory") then object.CanCollide=false;object.Massless=true end
+                end
+            end
+            avatar.Parent=nil
+            return avatar
+        end)
+        BotAvatarLoading[name]=nil
+        if not ok then warn("[SAE] Collector avatar "..name..": "..tostring(result));return nil end
+        if not Gui.Parent then result:Destroy();return nil end
+        template=result;BotAvatarModels[name]=template
     end
-    local model=fallbackBot(sequence)
-    if model then model:SetAttribute("CollectorAppearanceSequence",sequence) end
+    CollectorAvatarSerial+=1
+    local model=template:Clone()
+    model:SetAttribute("CollectorAvatarSource",name)
+    model:SetAttribute("CollectorUsername",name)
+    model:SetAttribute("CollectorDisplayName",name)
+    model:SetAttribute("CollectorAppearanceSequence",CollectorAvatarSerial)
     return model
 end
 
@@ -4005,7 +3983,72 @@ local function eggPickupPosition(egg)
     if st then st.pickupPosition=pos end
     return pos
 end
+local CollectorObstacles={}
+local CollectorObstacleScan=0
+local function collectorDetour(d,root,goal)
+    local now=os.clock()
+    if now>=CollectorObstacleScan then
+        CollectorObstacleScan=now+.5
+        CollectorObstacles={}
+        local folder=workspace:FindFirstChild("SAE_V7_PLACED")
+        if folder then
+            for _,model in ipairs(folder:GetChildren()) do
+                if model:IsA("Model") and model:GetAttribute("SAE_PLACED_TREADMILL") then
+                    local cf,size=model:GetBoundingBox()
+                    CollectorObstacles[#CollectorObstacles+1]={key=model,position=cf.Position,radius=math.sqrt(size.X^2+size.Z^2)/2+3}
+                end
+            end
+        end
+    end
+    local playerRoot=P.Character and P.Character:FindFirstChild("HumanoidRootPart")
+    if d.avoidance then
+        local avoid=d.avoidance
+        local moved=avoid.key==playerRoot and (playerRoot.Position-avoid.origin).Magnitude>3
+        if not avoid.key.Parent or moved or now>avoid.expires or horizontalDistance(root.Position,avoid.point)<2.5 then
+            d.avoidance=nil
+        else return avoid.point end
+    end
+    local delta=Vector3.new(goal.X-root.Position.X,0,goal.Z-root.Position.Z)
+    local distance=delta.Magnitude
+    if distance<1 then return goal end
+    local forward=delta.Unit
+    local side=Vector3.new(-forward.Z,0,forward.X)
+    local obstacles={}
+    if playerRoot then obstacles[1]={key=playerRoot,position=playerRoot.Position,radius=8} end
+    for _,obstacle in ipairs(CollectorObstacles) do obstacles[#obstacles+1]=obstacle end
+    for _,obstacle in ipairs(obstacles) do
+        if obstacle.key.Parent and math.abs(obstacle.position.Y-root.Position.Y)<12 then
+            local offset=Vector3.new(obstacle.position.X-root.Position.X,0,obstacle.position.Z-root.Position.Z)
+            local along=offset:Dot(forward)
+            if along>-.5 and along<math.min(distance+1,obstacle.radius+22) then
+                local nearest=root.Position+forward*math.clamp(along,0,distance)
+                if horizontalDistance(nearest,obstacle.position)<obstacle.radius then
+                    local sign=(root.Position-obstacle.position):Dot(side)>=0 and 1 or -1
+                    local params=RaycastParams.new()
+                    params.FilterType=Enum.RaycastFilterType.Exclude
+                    params.FilterDescendantsInstances={EggFolder,NPCFolder,P.Character}
+                    params.RespectCanCollide=true
+                    for _,direction in ipairs({sign,-sign}) do
+                        local point=obstacle.position+side*(direction*(obstacle.radius+2))
+                        point=Vector3.new(point.X,goal.Y,point.Z)
+                        local floor=groundHitNear(point,d.model)
+                        local flat=Vector3.new(point.X,root.Position.Y,point.Z)
+                        if floor and (not floor.Normal or floor.Normal.Y>.7)
+                            and not workspace:Raycast(root.Position,flat-root.Position,params) then
+                            point=Vector3.new(point.X,floor.Position.Y,point.Z)
+                            d.avoidance={key=obstacle.key,origin=obstacle.position,point=point,expires=now+4}
+                            return point
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return goal
+end
+
 local function moveCollector(d,h,r,goal)
+    goal=collectorDetour(d,r,goal)
     local now=os.clock()
     local nav=d.navigation
     if not nav or horizontalDistance(nav.goal,goal)>5 then
@@ -4015,12 +4058,17 @@ local function moveCollector(d,h,r,goal)
     if horizontalDistance(nav.lastPosition,r.Position)>1 then
         nav.lastPosition=r.Position; nav.lastProgress=now
     end
-    local rp=RaycastParams.new()
-    rp.FilterType=Enum.RaycastFilterType.Exclude
-    rp.FilterDescendantsInstances={EggFolder,NPCFolder,P.Character}
-    rp.RespectCanCollide=true
-    local flatGoal=Vector3.new(goal.X,r.Position.Y,goal.Z)
-    local obstruction=workspace:Raycast(r.Position,flatGoal-r.Position,rp)
+    local obstruction=nav.obstruction
+    if not nav.nextProbe or now>=nav.nextProbe then
+        nav.nextProbe=now+.35
+        local rp=RaycastParams.new()
+        rp.FilterType=Enum.RaycastFilterType.Exclude
+        rp.FilterDescendantsInstances={EggFolder,NPCFolder,P.Character}
+        rp.RespectCanCollide=true
+        local flatGoal=Vector3.new(goal.X,r.Position.Y,goal.Z)
+        obstruction=workspace:Raycast(r.Position,flatGoal-r.Position,rp)
+        nav.obstruction=obstruction
+    end
     if (obstruction or now-nav.lastProgress>1.2) and not nav.computing and now-nav.lastRequest>1 then
         nav.computing=true;nav.lastRequest=now;nav.generation=nav.generation+1
         local generation=nav.generation
@@ -4106,6 +4154,11 @@ local function clearBots()
     end
 end
 
+Gui.Destroying:Connect(function()
+    clearBots()
+    for name,model in pairs(BotAvatarModels) do model:Destroy();BotAvatarModels[name]=nil end
+end)
+
 local function stopCollectors()
     CollectorsEnabled=false
     clearReadyCollectors()
@@ -4168,7 +4221,7 @@ requestCollector=function(slot,generation)
     if generation~=CollectorGeneration or not CollectorsEnabled then return end
     -- Returning carriers can overlap outbound collectors, with a generous
     -- upper bound to avoid runaway models if movement becomes blocked.
-    if #Bots+CollectorPending>=48 or CollectorPendingSlots[slot] then return false end
+    if #Bots+CollectorPending>=34 or CollectorPendingSlots[slot] then return false end
     CollectorPending=CollectorPending+1
     CollectorPendingSlots[slot]=true
     task.spawn(function()
@@ -4188,7 +4241,7 @@ end
 local function startCollectorStream(generation)
     -- Prepare a few different avatars ahead of pickup, rather than making
     -- the next departure wait for a remote avatar load.
-    for _=1,2 do
+    for _=1,1 do
         task.spawn(function()
             while generation==CollectorGeneration and CollectorsEnabled do
                 if #CollectorReady<math.min(6,CollectorSlots+1) then
@@ -4209,10 +4262,10 @@ local function startCollectorStream(generation)
         while generation==CollectorGeneration and CollectorsEnabled do
             if os.clock()>=nextDeparture then
                 -- Depart independently of pickup and return times. One new
-                -- collector every three seconds spreads the trips out.
+                -- collector every 4.3 seconds reduces traffic by 30%.
                 local available=nearestEgg(CollectorOrigin,"BOT_STREAM_LOOK")
                 if available and requestCollector(slot,generation) then
-                    nextDeparture=os.clock()+3
+                    nextDeparture=os.clock()+(3/.7)
                     slot=slot%CollectorSlots+1
                 end
             end
@@ -4228,7 +4281,7 @@ botBrain=function(d)
         local lastDistance=nil
         local stuckSince=os.clock()
         while d.model and d.model.Parent do
-            task.wait(.08)
+            task.wait(.12)
             local m=d.model
             local h=m:FindFirstChildOfClass("Humanoid")
             local r=m:FindFirstChild("HumanoidRootPart")
@@ -4353,7 +4406,7 @@ local function spawnBots(n)
     end
     if not origin then return false,"The map's collector return area is not available yet." end
     clearBots()
-    BotAvatarUsed={};BotAvatarLooks={}
+    CollectorAvatarCursor=0
     CollectorOrigin=origin
     CollectorSlots=math.clamp(n,1,10)
     local nearest=nearestEgg(origin,"BOT_SPAWN_LOOK")
@@ -4720,10 +4773,7 @@ spawnBtn.Activated:Connect(function()
                 "MIXED",Amount,EggSize,Pattern,nil,"GENERAL",
                 function(done,total,stage)
                     spawnFeedback(stage or ("Spawning eggs: "..tostring(done).." / "..tostring(total)),C.purple2)
-                end,startFrame,function()
-                    spawnFeedback("Replacing the previous egg batch...",C.purple2)
-                    clearSpawnedEggs()
-                end)
+                end,startFrame)
             if not success then error(tostring(made),0) end
             spawnFeedback(tostring(made).." mixed eggs spawned in "..string.format("%.1f",os.clock()-startedAt).."s. "..tostring(typeCount or 0).." egg types.",C.green)
             notice(CFG.AnnouncementProfile.UserId,CFG.AnnouncementProfile.Name,"has spawned",tostring(made).." eggs","",Enum.Font.FredokaOne)
@@ -4747,7 +4797,7 @@ end
 Builders.SpawnEggs()
 Builders.SpawnEggs=nil
 -- Prepare reusable original visuals while the user is in the panel.
-task.defer(function() pcall(availableEggs) end)
+task.defer(warmEggBatch)
 
 function Builders.Announcements()
 section(AnnouncePage,"ANNOUNCEMENTS",4)
@@ -7193,8 +7243,8 @@ local function createTreadmillRuntime()
             if not ramp then
                 local scale=model:GetAttribute('SAE_TREADMILL_MODEL_SCALE') or 1
                 ramp=Instance.new('WedgePart') ramp.Name='SAE_TREADMILL_ENTRY_RAMP'
-                ramp.Size=Vector3.new(4.05,1.31,1.65)*scale
-                ramp.CFrame=model:GetPivot()*CFrame.new(0,-.165*scale,5.48*scale)*CFrame.Angles(0,math.pi,0)
+                ramp.Size=Vector3.new(4.05,.49,1.65)*scale
+                ramp.CFrame=model:GetPivot()*CFrame.new(0,.245*scale,5.48*scale)*CFrame.Angles(0,math.pi,0)
                 ramp.Anchored=true ramp.CanCollide=true ramp.CanTouch=false ramp.CanQuery=true
                 ramp.Transparency=1 ramp.CastShadow=false ramp.Parent=model
             end
@@ -7347,11 +7397,15 @@ local function createTreadmillRuntime()
                 local localPos=model:GetPivot():PointToObjectSpace(root.Position)
                 local scale=model:GetAttribute('SAE_TREADMILL_MODEL_SCALE') or 1
                 local beltY=.49*scale+standing
-                if math.abs(localPos.X)<1.85*scale and localPos.Z>-2.8*scale and localPos.Z<4.25*scale
-                    and math.abs(localPos.Y-beltY)<.85 and humanoid.FloorMaterial~=Enum.Material.Air then
-                    startRunning(entry,character,humanoid,root)
-                    break
-                end
+                local centred=math.abs(localPos.X)<.60*scale and math.abs(localPos.Z-.40*scale)<1.2*scale
+                    and math.abs(localPos.Y-beltY)<.35 and humanoid.FloorMaterial~=Enum.Material.Air
+                if centred then
+                    entry.mountSince=entry.mountSince or now
+                    if now-entry.mountSince>=.25 then
+                        startRunning(entry,character,humanoid,root)
+                        break
+                    end
+                else entry.mountSince=nil end
             end
         end
     end)
@@ -7408,6 +7462,10 @@ local function placeTreadmill(t,m)
     if look.Magnitude<.05 then look=Vector3.new(0,0,-1) end
     local target=CFrame.lookAt(hit.Position,hit.Position+look.Unit)
     local scale=m:GetAttribute('SAE_TREADMILL_MODEL_SCALE') or 1
+    local playerOffset=target:PointToObjectSpace(hrp.Position)
+    if math.abs(playerOffset.X)<3.8*scale and math.abs(playerOffset.Z)<5.6*scale then
+        return reject('Place the treadmill beside you, with room to stand clear.')
+    end
     -- All four feet need support at the same height: no ledges or suspended builds.
     for _,x in ipairs({-2.83,2.83}) do
         for _,z in ipairs({-4.20,4.20}) do
