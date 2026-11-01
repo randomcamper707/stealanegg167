@@ -1632,7 +1632,11 @@ function templateInfo(name)
     return info
 end
 
+local EggCatalogBusy=false
 function availableEggs()
+    while EggCatalogBusy do task.wait() end
+    EggCatalogBusy=true
+    local ok,result=pcall(function()
     local available,seen={},{}
     -- Match the original repository's explicit species list only. Do not
     -- turn every discovered egg effect/variant into an extra mixed-batch type.
@@ -1646,6 +1650,10 @@ function availableEggs()
         eggWorkYield()
     end
     return available
+    end)
+    EggCatalogBusy=false
+    if not ok then error(result) end
+    return result
 end
 
 -- Safe-zone state is declared before map/layout code so GENERAL egg spawning
@@ -2401,8 +2409,43 @@ function eggGroundHeight(pos,referenceY)
     return referenceY
 end
 
+-- Measure only the corridor ahead of the captured click position, not the
+-- entire map in eight directions. No Safe Zone offset is added to this mode.
+local function playerEggRegion(startFrame)
+    local base=startFrame.Position
+    local forward=startFrame.LookVector
+    local right=startFrame.RightVector
+    local function floorAt(point)
+        local hit=playableGroundHit(point,base.Y)
+        return hit and (not hit.Normal or hit.Normal.Y>=.7)
+    end
+    local depth=24
+    local foundFloor=false
+    local misses=0
+    for distance=24,4096,24 do
+        if floorAt(base+forward*distance) then depth=distance; foundFloor=true; misses=0
+        else misses=misses+1; if misses>=2 then break end end
+        eggWorkYield()
+    end
+    if not foundFloor then depth=2048 end
+    local half=math.huge
+    for _,distance in ipairs({0,math.min(depth*.25,120),math.min(depth*.5,240)}) do
+        local centre=base+forward*distance
+        for _,side in ipairs({-1,1}) do
+            local extent=0
+            for offset=6,120,6 do
+                if floorAt(centre+right*(offset*side)) then extent=offset else break end
+                eggWorkYield()
+            end
+            if extent>=12 then half=math.min(half,extent) end
+        end
+    end
+    local width=half<math.huge and math.max(24,half*2-4) or COMPACT_SPAWN_BOUNDS.X
+    return startFrame,Vector3.new(width,1,depth)
+end
+
 local EggBatchBusy=false
-local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgress)
+local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgress,startFrame)
     local mix=nil
     if name=="MIXED" then
         mix=availableEggs()
@@ -2445,7 +2488,8 @@ local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgres
     local footprintX=baseFootX*visualScale
     local footprintZ=baseFootZ*visualScale
 
-    local baseCF,bounds=visibleSpawnFrame(customCF,count,pattern,size)
+    local baseCF,bounds
+    if startFrame then baseCF,bounds=playerEggRegion(startFrame) else baseCF,bounds=visibleSpawnFrame(customCF,count,pattern,size) end
     local baseY=eggGroundHeight(baseCF.Position,baseCF.Position.Y)
     local forward=Vector3.new(baseCF.LookVector.X,0,baseCF.LookVector.Z)
     if forward.Magnitude<.01 then forward=Vector3.new(0,0,-1) else forward=forward.Unit end
@@ -2475,11 +2519,17 @@ local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgres
     local _,fieldRows,_,rowSpacing=physicalLayout(count,size,baseCF,bounds,pattern,footprintX,footprintZ)
     local fieldDepth=(fieldRows-1)*rowSpacing+footprintZ
     local nearOffset=math.max(0,((bounds and bounds.Z) or COMPACT_SPAWN_BOUNDS.Z)-4-fieldDepth)/2
-    baseCF=baseCF*CFrame.new(0,0,nearOffset)
+    if not startFrame then baseCF=baseCF*CFrame.new(0,0,nearOffset) end
+
+    local function batchPosition(index)
+        local pos,row,col,cols,rows,sx,sz,rowCols=layoutPosition(index,count,size,baseCF,bounds,pattern,footprintX,footprintZ)
+        if startFrame then pos=(baseCF*CFrame.new((col-(rowCols-1)/2)*sx,0,-row*sz)).Position end
+        return pos,row,col,cols,rows,sx,sz,rowCols
+    end
 
     local groundHeights={}
     for i=1,count do
-        local wanted=layoutPosition(i,count,size,baseCF,bounds,pattern,footprintX,footprintZ)
+        local wanted=batchPosition(i)
         groundHeights[i]=eggGroundHeight(wanted,baseY)
         if i%25==0 then task.wait() end
     end
@@ -2511,7 +2561,7 @@ local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgres
     local lastError=nil
 
     for i=1,count do
-        local wanted,row,col,cols,rows,_,_,rowCols=layoutPosition(i,count,size,baseCF,bounds,pattern,footprintX,footprintZ)
+        local wanted,row,col,cols,rows,_,_,rowCols=batchPosition(i)
         lastCols=cols
         lastRows=rows
         local preferred=name
@@ -2595,6 +2645,7 @@ end
 
 local function clearSpawnedEggs(batchTag)
     local removed=0
+    local slice=os.clock()
     for _,e in ipairs(EggFolder:GetChildren()) do
         if (not batchTag) or e:GetAttribute("SAE_Batch")==batchTag then
             local r=rootOf(e)
@@ -2605,7 +2656,7 @@ local function clearSpawnedEggs(batchTag)
             EggState[e]=nil
             pcall(function() e:Destroy() end)
             removed=removed+1
-            task.wait()
+            if removed%16==0 or os.clock()-slice>=.003 then task.wait(); slice=os.clock() end
         end
     end
     if HeldEgg and not HeldEgg.Parent then HeldEgg=nil; Carry.Visible=false end
@@ -3800,7 +3851,6 @@ local function startMeteorCountdown(seconds,statusCallback)
 end
 
 -- MAIN navigation and reference-style pages.
-local EggIndex=1
 local Amount=DEFAULT_EGG_COUNT
 local EggSize=300
 local Pattern=PATTERNS[1]
@@ -3858,7 +3908,7 @@ local function showAdminPage(name,push)
     Nav.Visible=(name~="Home")
     -- Size each branch to its controls instead of leaving a tall empty window.
     local heights={
-        Home=172, ["Spawn eggs"]=398, ["Mixed egg layouts"]=352,
+        Home=172, ["Spawn eggs"]=300,
         Announcements=312, Preset=336,
         Names=286, ["Avatar Name"]=330, ["Announcements Profile"]=384
     }
@@ -3875,7 +3925,6 @@ end)
 
 local HomePage=newAdminPage("Home",false)
 local EggsPage=newAdminPage("Spawn eggs",false)
-local PatternPage=newAdminPage("Mixed egg layouts",false)
 local AnnouncePage=newAdminPage("Announcements",false)
 local NamesPage=newAdminPage("Names",false)
 
@@ -3945,49 +3994,43 @@ end
 
 function Builders.SpawnEggs()
 -- SPAWN EGGS page
-local chooseBtn=button(EggsPage,"Choose egg",UDim2.fromOffset(4,4),UDim2.new(.5,-8,0,34),true)
-local mixedBtn=button(EggsPage,"Mixed eggs",UDim2.new(.5,4,0,4),UDim2.new(.5,-8,0,34),true)
-local selectedEggLabel=label(EggsPage,"Selected: MIXED",UDim2.fromOffset(5,42),UDim2.new(1,-10,0,18),10)
+local selectedEggLabel=label(EggsPage,"100 mixed eggs",UDim2.fromOffset(5,4),UDim2.new(1,-10,0,26),12)
 selectedEggLabel.TextColor3=C.purple2
-chooseBtn.MouseButton1Click:Connect(function()
-    EggIndex=EggIndex+1
-    if EggIndex>arrlen(EGGS) then EggIndex=2 end
-    if EggIndex==1 then EggIndex=2 end
-    selectedEggLabel.Text="Selected: "..EGGS[EggIndex]
-end)
-mixedBtn.MouseButton1Click:Connect(function() EggIndex=1; selectedEggLabel.Text="Selected: MIXED" end)
 
-local patternBtn=button(EggsPage,"Layout: ORIGINAL 6x20",UDim2.fromOffset(4,64),UDim2.new(1,-8,0,30),true)
-patternBtn.MouseButton1Click:Connect(function() showAdminPage("Mixed egg layouts",true) end)
-
-section(EggsPage,"BATCH",101)
-local amountLabel=label(EggsPage,"100 eggs per batch",UDim2.fromOffset(5,124),UDim2.new(1,-10,0,26),12)
+section(EggsPage,"BATCH",36)
+local amountLabel=label(EggsPage,"100 eggs per batch",UDim2.fromOffset(5,58),UDim2.new(1,-10,0,26),12)
 amountLabel.TextColor3=C.muted
 
 local sizeValue=function() return EggSize end
-sizeValue=intSlider(EggsPage,158,25,500,5,300,"Egg scale",function(v) EggSize=v end)
-local spawnBtn=button(EggsPage,"Spawn behind me",UDim2.fromOffset(4,210),UDim2.new(.5,-8,0,34),false)
-local clearEggBtn=button(EggsPage,"Clear eggs",UDim2.new(.5,4,0,210),UDim2.new(.5,-8,0,34),true)
-local spawnStatus=label(EggsPage,"Spawns eggs behind you, facing your direction.",UDim2.fromOffset(5,250),UDim2.new(1,-10,0,36),11)
+sizeValue=intSlider(EggsPage,92,25,500,5,300,"Egg scale",function(v) EggSize=v end)
+local spawnBtn=button(EggsPage,"Spawn mixed eggs",UDim2.fromOffset(4,148),UDim2.new(.5,-8,0,34),false)
+local clearEggBtn=button(EggsPage,"Clear eggs",UDim2.new(.5,4,0,148),UDim2.new(.5,-8,0,34),true)
+local spawnStatus=label(EggsPage,"Starts at your position and continues forward.",UDim2.fromOffset(5,190),UDim2.new(1,-10,0,36),11)
 spawnStatus.TextWrapped=true; spawnStatus.TextColor3=C.muted
 local EggSpawnBusy=false
 spawnBtn.MouseButton1Click:Connect(function()
     if EggSpawnBusy or EggBatchBusy then return end
     EggSpawnBusy=true
+    local startedAt=os.clock()
     local ok,err=pcall(function()
     spawnBtn.Text="SPAWNING..."
-    local en=EGGS[EggIndex]
+    local en="MIXED"
+    local root=P.Character and P.Character:FindFirstChild("HumanoidRootPart")
+    if not root then error("Character is not ready") end
+    local look=Vector3.new(root.CFrame.LookVector.X,0,root.CFrame.LookVector.Z)
+    if look.Magnitude<.01 then look=Vector3.new(0,0,-1) else look=look.Unit end
+    local humanoid=P.Character:FindFirstChildOfClass("Humanoid")
+    local floorY=root.Position.Y-(humanoid and humanoid.HipHeight or 2)-root.Size.Y/2
+    floorY=eggGroundHeight(Vector3.new(root.Position.X,floorY,root.Position.Z),floorY)
+    local start=Vector3.new(root.Position.X,floorY,root.Position.Z)
+    local startFrame=CFrame.lookAt(start,start+look)
     -- Each click is one clean batch, so the default batch contains at most 100 eggs in total.
     clearSpawnedEggs()
-    if callRemote("SpawnEggs",{Egg=en,Quantity=Amount,Size=EggSize,Pattern=Pattern,BehindPlayer=true}) then
-        spawnStatus.Text="Server spawn request sent."
-        spawnStatus.TextColor3=C.green
-    else
         local ok,made,cols,rows,fallbacks,appliedScale,typeCount=spawnEggs(en,Amount,EggSize,Pattern,nil,"GENERAL",function(done,total)
             spawnStatus.Text="Spawning eggs: "..tostring(done).." / "..tostring(total)
-        end)
+        end,startFrame)
         if ok then
-            spawnStatus.Text=tostring(made).." eggs spawned: "..tostring(rows).." rows, "..tostring(cols).." per row."
+            spawnStatus.Text=tostring(made).." mixed eggs spawned in "..string.format("%.1f",os.clock()-startedAt).."s."
             if en=="MIXED" then spawnStatus.Text=spawnStatus.Text.." "..tostring(typeCount or 0).." egg types." end
             if appliedScale and appliedScale<EggSize then spawnStatus.Text=spawnStatus.Text.." Scale fitted to "..tostring(appliedScale).." to stay inside the map." end
             spawnStatus.TextColor3=C.green
@@ -3995,47 +4038,19 @@ spawnBtn.MouseButton1Click:Connect(function()
         else
             spawnStatus.Text=tostring(made); spawnStatus.TextColor3=C.red
         end
-    end
     end)
     EggSpawnBusy=false
-    spawnBtn.Text="Spawn behind me"
+    spawnBtn.Text="Spawn mixed eggs"
     if not ok then spawnStatus.Text="Unable to spawn eggs: "..tostring(err); spawnStatus.TextColor3=C.red end
 end)
 clearEggBtn.MouseButton1Click:Connect(function() local n=clearSpawnedEggs(); spawnStatus.Text="Cleared "..n.." spawned egg(s)."; spawnStatus.TextColor3=C.green end)
 
--- mixed layout page from the reference screenshots
-local patternDescriptions={
-    ["ORIGINAL 6x20"]="Fill the playable floor with a continuous mix of every available egg type.",
-    ["ONE TYPE PER ROW"]="Every egg in one row is the same type; the next row changes type.",
-    ["SPLIT ROWS 3+3"]="Three of one type, then three of the next type, repeating across the row.",
-    ["PAIRS 2+2+2"]="Two of type A, two of type B, two of type C, repeating across the row.",
-    ["MIRRORED ROWS"]="Every second row reverses the left-to-right sequence.",
-    ["ALTERNATING ROWS"]="Whole rows alternate between two egg types.",
-    ["DIAGONAL SEQUENCE"]="Each row shifts the sequence by one, making diagonal bands."
-}
-local patStatus=label(PatternPage,"Choose a mixed egg layout",UDim2.fromOffset(5,0),UDim2.new(1,-10,0,22),11); patStatus.Font=Enum.Font.GothamBold
-for i,n in ipairs(PATTERNS) do
-    local patternName=n
-    local row=math.floor((i-1)/2); local col=(i-1)%2
-    local wide=(i==arrlen(PATTERNS) and (arrlen(PATTERNS)%2==1))
-    local pos=wide and UDim2.fromOffset(4,30+row*42) or UDim2.new(col*.5,col==0 and 4 or 4,0,30+row*42)
-    local sz=wide and UDim2.new(1,-8,0,36) or UDim2.new(.5,-8,0,36)
-    local b=button(PatternPage,patternName, pos, sz,true)
-    b.TextSize=10
-    b.TextWrapped=true
-    b.MouseButton1Click:Connect(function()
-        Pattern=patternName
-        patternBtn.Text="Layout: "..patternName
-        patStatus.Text=patternName.." selected"
-        showAdminPage("Spawn eggs",false)
-    end)
-end
-local patInfo=label(PatternPage,"Choose how mixed egg types repeat across rows.",UDim2.fromOffset(5,202),UDim2.new(1,-10,0,38),11)
-patInfo.TextWrapped=true; patInfo.TextColor3=C.muted
 
 end
 Builders.SpawnEggs()
 Builders.SpawnEggs=nil
+-- Prepare reusable original visuals while the user is in the panel.
+task.defer(function() pcall(availableEggs) end)
 
 function Builders.Announcements()
 section(AnnouncePage,"ANNOUNCEMENTS",4)
