@@ -1957,21 +1957,15 @@ local function physicalLayout(count,sizeValue,baseCF,bounds,pattern,footprintX,f
     end
     cols=math.min(cols,count)
 
-    -- Never squeeze the actual egg footprints to fit a requested batch.
-    -- Use fewer columns/rows when larger eggs need more breathing room.
+    -- Quantity and pattern define the grid. A detected patch of floor must
+    -- never reduce a requested 200/500-egg batch to a handful of eggs.
+    -- Use the measured scaled footprint plus a small, consistent air gap.
     local actualX=math.max(1,tonumber(footprintX) or (4*scale))
     local actualZ=math.max(1,tonumber(footprintZ) or (4*scale))
-    local sx=actualX+math.max(2,actualX*.30,1.1*scale)
-    local sz=actualZ+math.max(2.5,actualZ*.35,1.3*scale)
-    local usableWidth=((bounds and bounds.X) or COMPACT_SPAWN_BOUNDS.X)*.985
-    local usableDepth=((bounds and bounds.Z) or COMPACT_SPAWN_BOUNDS.Z)*.97
-    local fitCols=usableWidth>=actualX and math.floor((usableWidth-actualX)/sx)+1 or 0
-    local fitRows=usableDepth>=actualZ and math.floor((usableDepth-actualZ)/sz)+1 or 0
-    cols=math.max(1,math.min(cols,fitCols))
-    local capacity=cols*fitRows
-    if fitCols==0 then capacity=0 end
-    local rows=math.ceil(math.min(count,capacity)/cols)
-    return cols,rows,sx,sz,capacity
+    local sx=actualX+math.max(1.25,actualX*.08,.45*scale)
+    local sz=actualZ+math.max(1.5,actualZ*.08,.55*scale)
+    local rows=math.ceil(count/cols)
+    return cols,rows,sx,sz
 end
 local function layoutPosition(index,count,sizeValue,baseCF,bounds,pattern,footprintX,footprintZ)
     local cols,rows,sx,sz=physicalLayout(count,sizeValue,baseCF,bounds,pattern,footprintX,footprintZ)
@@ -2187,9 +2181,13 @@ local function spawnEggs(name,count,size,pattern,customCF,batchTag)
     baseCF=CFrame.lookAt(Vector3.new(baseCF.Position.X,baseY,baseCF.Position.Z),
         Vector3.new(baseCF.Position.X,baseY,baseCF.Position.Z)+forward)
 
-    local _,_,_,_,capacity=physicalLayout(count,size,baseCF,bounds,pattern,footprintX,footprintZ)
-    if capacity<1 then return false,"Not enough room for eggs at this scale. Choose a larger spawn area or lower the scale." end
-    count=math.min(count,capacity)
+    -- Grow the field away from its near edge as more rows are needed. This
+    -- preserves the Safe Zone buffer instead of centering extra rows over it.
+    local _,fieldRows,_,rowSpacing=physicalLayout(count,size,baseCF,bounds,pattern,footprintX,footprintZ)
+    local fieldDepth=(fieldRows-1)*rowSpacing+footprintZ
+    local detectedDepth=(bounds and bounds.Z) or COMPACT_SPAWN_BOUNDS.Z
+    local extraDepth=math.max(0,fieldDepth-detectedDepth)
+    baseCF=baseCF*CFrame.new(0,0,-extraDepth/2)
 
     local made=0
     local lastCols=0
@@ -3629,7 +3627,6 @@ spawnBtn.MouseButton1Click:Connect(function()
         local ok,made,cols,rows,fallbacks=spawnEggs(en,Amount,EggSize,Pattern,nil,"GENERAL")
         if ok then
             spawnStatus.Text=tostring(made).." eggs spawned: "..tostring(rows).." rows, "..tostring(cols).." per row."
-            if made<Amount then spawnStatus.Text=spawnStatus.Text.." Space fits "..tostring(made).." of "..tostring(Amount).." at this scale." end
             spawnStatus.TextColor3=C.green
             notice(P.UserId,Display,": spawned",tostring(made).." EGGS","")
         else
