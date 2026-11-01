@@ -925,12 +925,14 @@ CFG = {
     }
 }
 
--- Bounded, complete reference models only; no live effect-prefab discovery.
-local DEFAULT_EGG_COUNT=50
+-- Original game-asset catalog; gifting models are never used here.
+local DEFAULT_EGG_COUNT=100
 EGGS = {
-    "MIXED","Unicorn Egg","Kitsune Egg","Night Flame Egg","Archangel Egg",
-    "World Burner Egg","Aetheron Egg","Cthulhu Egg","Luminous Cthulhu Egg",
-    "Sabertooth Egg","Skeletal Sabertooth Egg","Octophant Egg","Mecha Scrambler Egg"
+    "MIXED","Skeleton Horse","World Burner","Equinox egg","Aetheron egg",
+    "Gorilla King egg","Nightflame egg","Eternal Lunar Dragon egg","Unicorn egg",
+    "Nibbles #013 Egg","Experiment #001 Egg","Scorched Dragon egg","Drilla egg",
+    "Void Dragon egg","Rifborn egg","Riftbeasts egg","Shattered Rift egg",
+    "Pegasus","ArchAngel","Oni Tiger egg","Kitsune egg"
 }
 PATTERNS = {"ORIGINAL 6x20","ONE TYPE PER ROW","SPLIT ROWS 3+3","PAIRS 2+2+2","MIRRORED ROWS","ALTERNATING ROWS","DIAGONAL SEQUENCE"}
 ALIAS = {
@@ -1575,24 +1577,20 @@ function completeEggBody(model)
     return count>=4
 end
 
-function completeEggFallback(name)
-    local env=(getgenv and getgenv()) or _G
-    local factory=env.SAE_COMPLETE_EGG_FACTORY
-    if type(factory)~="function" then return nil end
-    local ok,model=pcall(factory,name)
-    return ok and model or nil
-end
-
 function templateInfo(name)
     local cached=EggTemplateCache[name]
     if cached then return cached end
 
-    -- Only use the script's closed, static reference geometry. Quantity
-    -- limits cannot repair an incomplete live prefab.
-    local clone=completeEggFallback(name)
+    local source=findEgg(name)
+    if not source then return nil end
+    local clone=cloneWholeEgg(source)
     if not clone then return nil end
     clone=staticEggSnapshot(clone)
     stripEggTemplate(clone)
+    if not completeEggBody(clone) then
+        clone:Destroy()
+        return nil
+    end
     clone.Name=name
 
     local root=rootOf(clone)
@@ -1631,9 +1629,26 @@ function templateInfo(name)
 end
 
 function availableEggs()
-    local available={}
-    for i=2,arrlen(EGGS) do
-        if templateInfo(EGGS[i]) then table.insert(available,EGGS[i]) end
+    local available,seen={},{}
+    local function add(name,source)
+        if source and not seen[source] and templateInfo(name) then
+            seen[source]=true
+            table.insert(available,name)
+        end
+    end
+    for i=2,arrlen(EGGS) do add(EGGS[i],findEgg(EGGS[i])) end
+    for _,source in ipairs(eggAssetIndex().sources) do
+        if source.Parent and not seen[source] then
+            local name=source:GetAttribute("EggName") or source.Name
+            local n=norm(name)
+            if n~="egg" and n~="eggs" and n~="eggshell" and n~="eggnest" and n~="eggbase"
+                and n~="eggfx" and n~="eggvfx" and n~="eggstand" and n~="eggpart"
+                and n:find("egg",1,true) and not eggAssetCollection(source)
+                and (not EggCache[name] or EggCache[name]==source) then
+                EggCache[name]=source
+                add(name,source)
+            end
+        end
         eggWorkYield()
     end
     return available
@@ -2121,12 +2136,12 @@ local function physicalLayout(count,sizeValue,baseCF,bounds,pattern,footprintX,f
     -- long axis. Never replace the selected count with an area capacity.
     local actualX=math.max(.1,tonumber(footprintX) or (4*scale))
     local actualZ=math.max(.1,tonumber(footprintZ) or (4*scale))
-    local sx=actualX+math.max(.2,actualX*.02,.06*scale)
-    local sz=actualZ+math.max(.125,actualZ*.01,.0375*scale)
+    local sx=actualX+math.max(.15,actualX*.01,.03*scale)
+    local sz=actualZ+math.max(.1,actualZ*.005,.02*scale)
     local width=math.max(0,((bounds and bounds.X) or COMPACT_SPAWN_BOUNDS.X)-4)
     local depth=math.max(0,((bounds and bounds.Z) or COMPACT_SPAWN_BOUNDS.Z)-4)
     local fitCols=width>=actualX and math.floor((width-actualX)/sx)+1 or 0
-    local minCols=math.min(count,3)
+    local minCols=1
     cols=math.max(minCols,math.min(cols,fitCols))
     local rows=math.ceil(count/cols)
     local fits=fitCols>=cols and ((rows-1)*sz+actualZ)<=depth
@@ -2191,8 +2206,8 @@ local function eggPhysics(o,anchored)
     if o:IsA("BasePart") then f(o) else for _,p in ipairs(o:GetDescendants()) do if p:IsA("BasePart") then f(p) end end end
 end
 local function scaleEgg(o,v,nativeSize)
-    local nativeSpan=nativeSize and math.max(nativeSize.X,nativeSize.Y,nativeSize.Z) or 10
-    -- Scale 300 means a visible 30-stud egg, regardless of the source model's
+    local nativeSpan=nativeSize and nativeSize.Y or 10
+    -- Scale 300 means a visible height of 30 studs for every egg, regardless of its
     -- native units. A huge source must not make every other species miniature.
     local f=(math.clamp(v,25,500)/100)*10/math.max(nativeSpan,.01)
     if o:IsA("Model") then o:ScaleTo(o:GetScale()*f) else o.Size=o.Size*f end
@@ -2409,7 +2424,7 @@ local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgres
     local active=0
     for egg in pairs(EggState) do if egg.Parent then active=active+1 end end
     local availableSlots=DEFAULT_EGG_COUNT-active
-    if availableSlots<=0 then return false,"The 50-egg limit is reached. Clear the current eggs before spawning more." end
+    if availableSlots<=0 then return false,"The 100-egg limit is reached. Clear the current eggs before spawning more." end
     count=math.min(count,availableSlots)
     size=math.clamp(tonumber(size) or 300,25,500)
     pattern=pattern or PATTERNS[1]
@@ -2422,7 +2437,7 @@ local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgres
         local inf=eggName and templateInfo(eggName) or nil
         local sz=inf and inf.size or nil
         if sz then
-            local nativeSpan=math.max(sz.X,sz.Y,sz.Z,.01)
+            local nativeSpan=math.max(sz.Y,.01)
             baseFootX=math.max(baseFootX,sz.X*10/nativeSpan)
             baseFootZ=math.max(baseFootZ,sz.Z*10/nativeSpan)
         end
@@ -2461,16 +2476,42 @@ local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgres
         footprintZ=baseFootZ*visualScale
     end
 
-    -- Keep the dense field at the near end of the usable floor; do not
-    -- distribute a small batch over thousands of studs of empty corridor.
-    local _,fieldRows,_,rowSpacing=physicalLayout(count,size,baseCF,bounds,pattern,footprintX,footprintZ)
-    local fieldDepth=(fieldRows-1)*rowSpacing+footprintZ
-    local nearOffset=math.max(0,((bounds and bounds.Z) or COMPACT_SPAWN_BOUNDS.Z)-4-fieldDepth)/2
-    baseCF=baseCF*CFrame.new(0,0,nearOffset)
+    -- Pack each row using the actual selected eggs' widths and depths.
+    -- A wide-winged species must not reserve its width around every narrow egg.
+    local columns,rowCount=physicalLayout(count,size,baseCF,bounds,pattern,footprintX,footprintZ)
+    local plans,packedRows={},{}
+    local xGap=math.max(.15,footprintX*.01,.03*visualScale)
+    local zGap=math.max(.1,footprintZ*.005,.02*visualScale)
+    for i=1,count do
+        local row=math.floor((i-1)/columns)
+        local col=(i-1)%columns
+        local rowCols=math.min(columns,count-row*columns)
+        local en=name=="MIXED" and mixedEggFor(pattern,mix,row,col,i,rowCols) or name
+        local info=templateInfo(en)
+        local factor=(size/100)*10/math.max(info.size.Y,.01)
+        local entry={name=en,width=info.size.X*factor,depth=info.size.Z*factor,row=row,col=col,rowCols=rowCols}
+        plans[i]=entry
+        local r=packedRows[row+1]
+        if not r then r={items={},width=0,depth=0}; packedRows[row+1]=r end
+        if #r.items>0 then r.width=r.width+xGap end
+        r.width=r.width+entry.width
+        r.depth=math.max(r.depth,entry.depth)
+        table.insert(r.items,entry)
+    end
+    local nearZ=(((bounds and bounds.Z) or COMPACT_SPAWN_BOUNDS.Z)-4)/2
+    for _,r in ipairs(packedRows) do
+        local z=nearZ-r.depth/2
+        local x=-r.width/2
+        for _,entry in ipairs(r.items) do
+            entry.wanted=(baseCF*CFrame.new(x+entry.width/2,0,z)).Position
+            x=x+entry.width+xGap
+        end
+        nearZ=nearZ-r.depth-zGap
+    end
 
     local groundHeights={}
     for i=1,count do
-        local wanted=layoutPosition(i,count,size,baseCF,bounds,pattern,footprintX,footprintZ)
+        local wanted=plans[i].wanted
         groundHeights[i]=eggGroundHeight(wanted,baseY)
         if i%25==0 then task.wait() end
     end
@@ -2502,15 +2543,21 @@ local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgres
     local lastError=nil
 
     for i=1,count do
-        local wanted,row,col,cols,rows,_,_,rowCols=layoutPosition(i,count,size,baseCF,bounds,pattern,footprintX,footprintZ)
-        lastCols=cols
-        lastRows=rows
-        local preferred=name
-        if name=="MIXED" then preferred=mixedEggFor(pattern,mix,row,col,i,rowCols or cols) end
+        local entry=plans[i]
+        local wanted=entry.wanted
+        lastCols=columns
+        lastRows=rowCount
+        local preferred=entry.name
         local candidates={preferred}
         if mix then
             for _,alternative in ipairs(mix) do
-                if alternative~=preferred then table.insert(candidates,alternative) end
+                if alternative~=preferred then
+                    local alt=templateInfo(alternative)
+                    local factor=alt and (size/100)*10/math.max(alt.size.Y,.01) or 0
+                    if alt and alt.size.X*factor<=entry.width+.001 and alt.size.Z*factor<=entry.depth+.001 then
+                        table.insert(candidates,alternative)
+                    end
+                end
             end
         end
         local placed=false
@@ -3303,18 +3350,18 @@ local function spawnSammyBatch(refillOnly)
         local current=countBatch("SAMMY240")
         local need=math.max(0,target-current)
         if need<=0 then
-            return true,"Sammy batch: 50 / 50 eggs."
+            return true,"Sammy batch: 100 / 100 eggs."
         end
 
         local ok,msg=spawnEggs("MIXED",need,200,"DIAGONAL SEQUENCE",cf,"SAMMY240")
         if not ok and attempt==3 then
-            return false,"Sammy batch stopped at "..tostring(countBatch("SAMMY240")).." / 50. "..tostring(msg)
+            return false,"Sammy batch stopped at "..tostring(countBatch("SAMMY240")).." / 100. "..tostring(msg)
         end
         task.wait()
     end
 
     local final=countBatch("SAMMY240")
-    return final>=target, final>=target and "Sammy batch: 50 / 50 eggs." or ("Sammy batch: "..tostring(final).." / 50 eggs.")
+    return final>=target, final>=target and "Sammy batch: 100 / 100 eggs." or ("Sammy batch: "..tostring(final).." / 100 eggs.")
 end
 
 local function markSammySpot()
@@ -3338,7 +3385,7 @@ end
 task.spawn(function()
     while Gui.Parent do
         task.wait(1)
-        if SammyAutoRefill and countBatch("SAMMY240")<=40 then
+        if SammyAutoRefill and countBatch("SAMMY240")<=80 then
             spawnSammyBatch(true)
         end
     end
@@ -3952,7 +3999,7 @@ local patternBtn=button(EggsPage,"Layout: ORIGINAL 6x20",UDim2.fromOffset(4,64),
 patternBtn.MouseButton1Click:Connect(function() showAdminPage("Mixed egg layouts",true) end)
 
 section(EggsPage,"BATCH",101)
-local amountLabel=label(EggsPage,"50 eggs per batch",UDim2.fromOffset(5,124),UDim2.new(1,-10,0,26),12)
+local amountLabel=label(EggsPage,"100 eggs per batch",UDim2.fromOffset(5,124),UDim2.new(1,-10,0,26),12)
 amountLabel.TextColor3=C.muted
 
 local sizeValue=function() return EggSize end
@@ -3968,7 +4015,7 @@ spawnBtn.MouseButton1Click:Connect(function()
     local ok,err=pcall(function()
     spawnBtn.Text="SPAWNING..."
     local en=EGGS[EggIndex]
-    -- Each click is one clean batch, so the default batch contains at most 50 eggs in total.
+    -- Each click is one clean batch, so the default batch contains at most 100 eggs in total.
     clearSpawnedEggs()
     if callRemote("SpawnEggs",{Egg=en,Quantity=Amount,Size=EggSize,Pattern=Pattern,BehindPlayer=true}) then
         spawnStatus.Text="Server spawn request sent."
@@ -4473,13 +4520,13 @@ BotAvatarPage.CanvasSize=UDim2.fromOffset(0,275)
 
 -- Sammy tab, closely matching the reference panel.
 local sy=0
-local sammyHeader=label(BotSammyPage,"SAMMY S7 - 50 MIXED EGGS / 2x",UDim2.fromOffset(5,sy),UDim2.new(1,-16,0,26),11); sammyHeader.Font=Enum.Font.GothamBold; sy=sy+32
+local sammyHeader=label(BotSammyPage,"SAMMY S7 - 100 MIXED EGGS / 2x",UDim2.fromOffset(5,sy),UDim2.new(1,-16,0,26),11); sammyHeader.Font=Enum.Font.GothamBold; sy=sy+32
 local spawnSammyButton=button(BotSammyPage,"Spawn Sammy",UDim2.fromOffset(0,sy),UDim2.new(1,-6,0,38),false); sy=sy+45
 local markSpotButton=button(BotSammyPage,"Mark this spot",UDim2.fromOffset(0,sy),UDim2.new(1,-6,0,34),true); sy=sy+38
 local spotStatus=label(BotSammyPage,"No spot marked. Uses the map center.",UDim2.fromOffset(5,sy),UDim2.new(1,-16,0,32),9); spotStatus.TextColor3=C.muted; spotStatus.TextWrapped=true; sy=sy+37
-local sammyEggButton=button(BotSammyPage,"Spawn 50 eggs / refill empty spots",UDim2.fromOffset(0,sy),UDim2.new(1,-6,0,38),false); sy=sy+45
+local sammyEggButton=button(BotSammyPage,"Spawn 100 eggs / refill empty spots",UDim2.fromOffset(0,sy),UDim2.new(1,-6,0,38),false); sy=sy+45
 local clearSammyEggs=button(BotSammyPage,"CLEAR SAMMY EGGS",UDim2.fromOffset(0,sy),UDim2.new(1,-6,0,35),true); clearSammyEggs:SetAttribute("RestingColor",Color3.fromRGB(120,30,68)); sy=sy+42
-local autoRefillBtn=button(BotSammyPage,"AUTO REFILL: OFF - after 10 gone",UDim2.fromOffset(0,sy),UDim2.new(1,-6,0,34),true); sy=sy+41
+local autoRefillBtn=button(BotSammyPage,"AUTO REFILL: OFF - after 20 gone",UDim2.fromOffset(0,sy),UDim2.new(1,-6,0,34),true); sy=sy+41
 local testBannerBtn=button(BotSammyPage,"Test banner",UDim2.fromOffset(0,sy),UDim2.new(.5,-8,0,33),true)
 local advertiseBtn=button(BotSammyPage,"ADVERTISE: OFF",UDim2.new(.5,3,0,sy),UDim2.new(.5,-9,0,33),true); sy=sy+42
 local sammyDirect=textbox(BotSammyPage,"This box always announces as Sammy",UDim2.fromOffset(0,sy),UDim2.new(1,-6,0,42),""); sy=sy+48
@@ -4499,7 +4546,7 @@ spawnSammyButton.MouseButton1Click:Connect(function() if callRemote("SpawnSammy"
 markSpotButton.MouseButton1Click:Connect(function() local ok,msg=markSammySpot(); spotStatus.Text=msg; spotStatus.TextColor3=ok and C.green or C.red end)
 sammyEggButton.MouseButton1Click:Connect(function() local ok,msg=spawnSammyBatch(countBatch("SAMMY240")>0); sammyPanelStatus.Text=msg; sammyPanelStatus.TextColor3=ok and C.green or C.red end)
 clearSammyEggs.MouseButton1Click:Connect(function() local n=clearSpawnedEggs("SAMMY240"); sammyPanelStatus.Text="Cleared "..n.." Sammy egg(s)."; sammyPanelStatus.TextColor3=C.green end)
-autoRefillBtn.MouseButton1Click:Connect(function() SammyAutoRefill=not SammyAutoRefill; autoRefillBtn.Text=SammyAutoRefill and "AUTO REFILL: ON - after 10 gone" or "AUTO REFILL: OFF - after 10 gone"; autoRefillBtn:SetAttribute("RestingColor",SammyAutoRefill and C.purple or C.card2) end)
+autoRefillBtn.MouseButton1Click:Connect(function() SammyAutoRefill=not SammyAutoRefill; autoRefillBtn.Text=SammyAutoRefill and "AUTO REFILL: ON - after 20 gone" or "AUTO REFILL: OFF - after 20 gone"; autoRefillBtn:SetAttribute("RestingColor",SammyAutoRefill and C.purple or C.card2) end)
 testBannerBtn.MouseButton1Click:Connect(function() sammyBanner(SammyMessages[1] or "Sammy test banner") end)
 advertiseBtn.MouseButton1Click:Connect(function() SammyAdvertise=not SammyAdvertise; advertiseBtn.Text=SammyAdvertise and "ADVERTISE: ON" or "ADVERTISE: OFF"; advertiseBtn:SetAttribute("RestingColor",SammyAdvertise and C.purple or C.card2) end)
 sammyDirect.FocusLost:Connect(function(enter) if enter and sammyDirect.Text~="" then sammyBanner(sammyDirect.Text); sammyDirect.Text="" end end)
@@ -6084,16 +6131,6 @@ local function model(cat,name)
         preparedModels[key]=entry
     end
     return entry.template:Clone(),entry.exact
-end
-
--- Reuse existing complete reference geometry when a live spawn asset is
--- an unassembled effect prefab. Do not invent replacement meshes.
-E.SAE_COMPLETE_EGG_FACTORY=function(requested)
-    local key=norm(requested):gsub("egg$","")
-    for name in pairs(EGG_DESIGNS) do
-        if norm(name):gsub("egg$","")==key then return model("Eggs",name) end
-    end
-    return nil
 end
 
 -- Cinematic parcels use isolated clones of the same 3D inventory models.
