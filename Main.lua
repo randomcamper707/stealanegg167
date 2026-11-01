@@ -1374,7 +1374,7 @@ local EggWorkDeadline=0
 function eggWorkYield()
     if os.clock()>=EggWorkDeadline then
         task.wait()
-        EggWorkDeadline=os.clock()+.002
+        EggWorkDeadline=os.clock()+.008
     end
 end
 
@@ -2140,12 +2140,14 @@ local function physicalLayout(count,sizeValue,baseCF,bounds,pattern,footprintX,f
     local actualZ=math.max(.1,tonumber(footprintZ) or (4*scale))
     local sx=actualX+math.max(.2,actualX*.02,.06*scale)
     local sz=actualZ+math.max(.125,actualZ*.01,.0375*scale)
-    local width=math.max(0,((bounds and bounds.X) or COMPACT_SPAWN_BOUNDS.X)-4)
+    local width=math.max(0,((bounds and bounds.X) or COMPACT_SPAWN_BOUNDS.X)-.5)
     local depth=math.max(0,((bounds and bounds.Z) or COMPACT_SPAWN_BOUNDS.Z)-4)
     local fitCols=width>=actualX and math.floor((width-actualX)/sx)+1 or 0
     local minCols=math.min(count,3)
     cols=math.max(minCols,math.min(cols,fitCols))
     local rows=math.ceil(count/cols)
+    -- Use the full width: the outside footprints finish beside each wall.
+    if cols>1 then sx=math.max(sx,(width-actualX)/(cols-1)) end
     local fits=fitCols>=cols and ((rows-1)*sz+actualZ)<=depth
     return cols,rows,sx,sz,fits
 end
@@ -2158,6 +2160,10 @@ local function layoutPosition(index,count,sizeValue,baseCF,bounds,pattern,footpr
     -- on one side of the map.
     local rowStart=row*cols
     local rowCols=math.min(cols,count-rowStart)
+    if rowCols>1 then
+        local width=math.max(0,((bounds and bounds.X) or COMPACT_SPAWN_BOUNDS.X)-.5)
+        sx=(width-footprintX)/(rowCols-1)
+    end
     local x=(col-(rowCols-1)/2)*sx
     local z=(row-(rows-1)/2)*sz
     local pos=(baseCF*CFrame.new(x,0,z)).Position
@@ -2430,23 +2436,40 @@ local function eggWallDistance(origin,direction,distance)
     for _,height in ipairs({3,10}) do
         local rp=RaycastParams.new()
         rp.FilterType=Enum.RaycastFilterType.Exclude
-        rp.FilterDescendantsInstances={EggFolder,NPCFolder,P.Character}
+        local excluded={EggFolder,NPCFolder}
+        if P.Character then table.insert(excluded,P.Character) end
         rp.RespectCanCollide=true
-        local hit=workspace:Raycast(origin+Vector3.new(0,height,0),direction*distance,rp)
-        if hit and (not hit.Normal or math.abs(hit.Normal.Y)<.6) then
-            nearest=math.min(nearest,hit.Distance or (hit.Position-origin-Vector3.new(0,height,0)).Magnitude)
+        for _=1,12 do
+            rp.FilterDescendantsInstances=excluded
+            local hit=workspace:Raycast(origin+Vector3.new(0,height,0),direction*distance,rp)
+            if not hit then break end
+            local part=hit.Instance
+            local wall=not part
+            if part and part:IsA("BasePart") then
+                local span=math.max(part.Size.X,part.Size.Z)
+                local thickness=math.max(.1,math.min(part.Size.X,part.Size.Z))
+                local name=norm(part.Name)
+                wall=part.Size.Y>=8 and (name:find("wall",1,true) or name:find("boundary",1,true)
+                    or (span>=18 and span/thickness>=4))
+            end
+            if wall and (not hit.Normal or math.abs(hit.Normal.Y)<.6) then
+                nearest=math.min(nearest,hit.Distance or (hit.Position-origin-Vector3.new(0,height,0)).Magnitude)
+                break
+            end
+            if not part then break end
+            table.insert(excluded,part)
         end
     end
     return nearest
 end
-local function playerEggRegion(startFrame)
+local function playerEggRegion(startFrame,requiredDepth)
     local base=startFrame.Position
     local forward=startFrame.LookVector
     local right=startFrame.RightVector
     local function floorAt(point)
         return eggGroundHeight(point,base.Y,true)~=nil
     end
-    local maxDepth=math.max(0,eggWallDistance(base,forward,4096)-2)
+    local maxDepth=math.max(0,eggWallDistance(base,forward,4096)-.25)
     local depth=0
     for distance=0,maxDepth,12 do
         if not floorAt(base+forward*distance) then break end
@@ -2456,16 +2479,19 @@ local function playerEggRegion(startFrame)
     -- Never invent a 2048-stud floor when a probe fails.
     if depth<12 then return nil,nil end
     local left,rightEdge=120,120
-    for distance=0,depth,24 do
+    -- Check the whole possible batch footprint, without including a remote
+    -- doorway beyond the last row in this batch.
+    for distance=0,math.min(depth,requiredDepth or depth),24 do
         local centre=base+forward*distance
         local limits={}
         for _,side in ipairs({-1,1}) do
-            local limit=math.max(0,eggWallDistance(centre,right*side,120)-2)
+            local limit=math.max(0,eggWallDistance(centre,right*side,120)-.25)
             local extent=0
             for offset=0,limit,6 do
                 if not floorAt(centre+right*(offset*side)) then break end
                 extent=offset
             end
+            if floorAt(centre+right*(limit*side)) then extent=limit end
             limits[side]=extent
         end
         left=math.min(left,limits[-1]); rightEdge=math.min(rightEdge,limits[1])
@@ -2503,16 +2529,16 @@ local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgres
     -- Every species uses the same visible span for a given slider value.
     local baseFootX=0
     local baseFootZ=0
+    local footprintFrame=startFrame
     local function includeFootprint(eggName)
         local inf=eggName and templateInfo(eggName) or nil
         local sz=inf and inf.size or nil
         if sz then
             local nativeSpan=math.max(sz.X,sz.Y,sz.Z,.01)
-            -- Clones retain their source orientation; a square footprint remains
-            -- safe even when the corridor is rotated relative to those models.
-            local span=math.max(sz.X,sz.Z)*10/nativeSpan
-            baseFootX=math.max(baseFootX,span)
-            baseFootZ=math.max(baseFootZ,span)
+            local r=footprintFrame and footprintFrame.RightVector or Vector3.new(1,0,0)
+            local f=footprintFrame and footprintFrame.LookVector or Vector3.new(0,0,-1)
+            baseFootX=math.max(baseFootX,(math.abs(r.X)*sz.X+math.abs(r.Z)*sz.Z)*10/nativeSpan)
+            baseFootZ=math.max(baseFootZ,(math.abs(f.X)*sz.X+math.abs(f.Z)*sz.Z)*10/nativeSpan)
         end
     end
     if name=="MIXED" then
@@ -2525,13 +2551,34 @@ local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgres
     local footprintZ=baseFootZ*visualScale
 
     local baseCF,bounds
-    if startFrame then baseCF,bounds=playerEggRegion(startFrame) else baseCF,bounds=visibleSpawnFrame(customCF,count,pattern,size) end
+    if startFrame then baseCF,bounds=playerEggRegion(startFrame,math.ceil(count/3)*(footprintZ+1)+4) else baseCF,bounds=visibleSpawnFrame(customCF,count,pattern,size) end
     if not baseCF or not bounds then return false,"No usable floor ahead. Face along the corridor and try again." end
     local baseY=eggGroundHeight(baseCF.Position,baseCF.Position.Y)
     local forward=Vector3.new(baseCF.LookVector.X,0,baseCF.LookVector.Z)
     if forward.Magnitude<.01 then forward=Vector3.new(0,0,-1) else forward=forward.Unit end
     baseCF=CFrame.lookAt(Vector3.new(baseCF.Position.X,baseY,baseCF.Position.Z),
         Vector3.new(baseCF.Position.X,baseY,baseCF.Position.Z)+forward)
+
+    footprintFrame=baseCF
+    baseFootX=0; baseFootZ=0
+    if mix then for _,en in ipairs(mix) do includeFootprint(en) end else includeFootprint(name) end
+    footprintX=baseFootX*visualScale; footprintZ=baseFootZ*visualScale
+
+    -- Avoid dropping a whole column because of a tiny spacing remainder.
+    -- A uniform adjustment of at most 6% lets four large eggs fill a lane
+    -- that is only slightly narrower than four native footprints.
+    local usableWidth=math.max(0,bounds.X-.5)
+    local packedColumns=math.min(count,math.floor(usableWidth/(footprintX*.94+.2)))
+    local regularColumns=select(1,physicalLayout(count,size,baseCF,bounds,pattern,footprintX,footprintZ))
+    if packedColumns>regularColumns and packedColumns>=3 then
+        local packedWidth=math.min((usableWidth-(packedColumns-1)*.2)/packedColumns,
+            usableWidth/(packedColumns+.02*(packedColumns-1)))
+        local packedSize=packedWidth/math.max(baseFootX,.01)*100-.001
+        if packedSize>=size*.94 and packedSize<size then
+            size=packedSize;visualScale=size/100
+            footprintX=baseFootX*visualScale;footprintZ=baseFootZ*visualScale
+        end
+    end
 
     -- Keep every egg inside the measured region. If necessary, reduce the
     -- effective scale, never the quantity or the gaps.
@@ -2577,11 +2624,9 @@ local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgres
         if batchTemplates[en] then return batchTemplates[en] end
         local template=info.template:Clone()
         local scale=scaleEgg(template,size,info.size)
-        local visualCF,visualSize=eggVisualBounds(template)
-        if not visualCF then template:Destroy(); return nil end
-        local pivotCF=template:IsA("Model") and template:GetPivot() or template.CFrame
-        local bottom=visualCF.Position.Y-visualSize.Y/2
-        local offset=pivotCF.Position+Vector3.new(-visualCF.Position.X,-bottom,-visualCF.Position.Z)
+        -- templateInfo already measured the complete native geometry. Scaling
+        -- its cached offsets is exact and avoids walking every part again.
+        local offset=Vector3.new(-info.centerOffset.X*scale,-info.bottomOffset*scale,-info.centerOffset.Z*scale)
         pivot(template,CFrame.new(offset))
         local prepared={template=template,offset=offset,scale=scale}
         batchTemplates[en]=prepared
@@ -2623,11 +2668,18 @@ local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgres
                     egg.Name=en
                     if batchTag then egg:SetAttribute("SAE_Batch",batchTag) end
                     local offset=prepared.offset
-                    pivot(egg,CFrame.new(wanted.X+offset.X,(groundHeights[i] or baseY)+offset.Y,wanted.Z+offset.Z))
+                    local placement=wanted
+                    if rowCols>1 and (col==0 or col==rowCols-1) then
+                        local r=baseCF.RightVector
+                        local visibleWidth=(math.abs(r.X)*info.size.X+math.abs(r.Z)*info.size.Z)*prepared.scale
+                        local side=col==0 and -1 or 1
+                        placement=placement+r*(side*math.max(0,footprintX-visibleWidth)/2)
+                    end
+                    pivot(egg,CFrame.new(placement.X+offset.X,(groundHeights[i] or baseY)+offset.Y,placement.Z+offset.Z))
                     egg.Parent=EggFolder
                     registerEgg(egg,en,prepared.scale)
                     if not EggState[egg] then error("Egg has no usable pickup root") end
-                    EggState[egg].pickupPosition=Vector3.new(wanted.X,groundHeights[i] or baseY,wanted.Z)
+                    EggState[egg].pickupPosition=Vector3.new(placement.X,groundHeights[i] or baseY,placement.Z)
                 end)
                 if ok then
                     made=made+1
@@ -2649,7 +2701,7 @@ local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgres
         end
         if not placed then break end
         if onProgress and (made==1 or made%5==0 or made==count) then onProgress(made,count) end
-        if i%8==0 or os.clock()-spawnSlice>=.003 then
+        if i%20==0 or os.clock()-spawnSlice>=.008 then
             task.wait()
             spawnSlice=os.clock()
         end
@@ -3879,7 +3931,7 @@ local function spawnBots(n)
                 local id=BOT_NAMES[((i-1)%arrlen(BOT_NAMES))+1]
                 local tr=TRAILS[math.random(1,arrlen(TRAILS))]
                 local stat=math.random(200,270)*1000000
-                local speed=24+((stat-200000000)/70000000)*8
+                local speed=65+((stat-200000000)/70000000)*20
 
                 -- Spawn in a small formation INSIDE the safe zone.
                 local row=math.floor((i-1)/4)
