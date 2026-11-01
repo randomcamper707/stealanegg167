@@ -1589,6 +1589,25 @@ function completeEggBody(model)
     return count>=4
 end
 
+-- Wide wings must not make World Burner's egg body miniature.
+-- Calibrate height once in the reusable source, retaining its X/Z footprint.
+function normalizeWorldBurnerEgg(model,name)
+    if norm(name)~="worldburner" and norm(name)~="worldburneregg" then return end
+    local cf,size=eggVisualBounds(model)
+    if not cf or size.Y<.01 then return end
+    local factor=math.max(size.X,size.Y,size.Z)/size.Y
+    if factor<=1.01 then return end
+    local nodes=model:IsA("BasePart") and {model} or model:GetDescendants()
+    for _,part in ipairs(nodes) do
+        if part:IsA("BasePart") then
+            local y=cf.Position.Y+(part.Position.Y-cf.Position.Y)*factor
+            part.CFrame=part.CFrame+Vector3.new(0,y-part.Position.Y,0)
+            part.Size=Vector3.new(part.Size.X,part.Size.Y*factor,part.Size.Z)
+        end
+        eggWorkYield()
+    end
+end
+
 function templateInfo(name)
     local cached=EggTemplateCache[name]
     if cached then return cached end
@@ -1604,6 +1623,7 @@ function templateInfo(name)
         return nil
     end
     clone.Name=name
+    normalizeWorldBurnerEgg(clone,name)
 
     local root=rootOf(clone)
     if not root then
@@ -2544,6 +2564,31 @@ local function playerEggRegion(startFrame,requiredDepth)
     return CFrame.lookAt(centre,centre+forward),Vector3.new(left+rightEdge,1,depth)
 end
 
+local LastMixedEggOrder=nil
+local function shuffledEggOrder(mix,count)
+    local order={}
+    while #order<count do
+        local bag=table.clone(mix)
+        for i=#bag,2,-1 do
+            local j=math.random(1,i)
+            bag[i],bag[j]=bag[j],bag[i]
+        end
+        for _,name in ipairs(bag) do
+            if #order>=count then break end
+            table.insert(order,name)
+        end
+    end
+    -- Also avoid an identical reroll when a small catalog happens to repeat.
+    local signature=table.concat(order,"|")
+    if signature==LastMixedEggOrder and #mix>1 and #order>1 then
+        local first=table.remove(order,1)
+        table.insert(order,first)
+        signature=table.concat(order,"|")
+    end
+    LastMixedEggOrder=signature
+    return order
+end
+
 local EggBatchBusy=false
 local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgress,startFrame,beforePlacement)
     if onProgress then onProgress(0,count,"Preparing egg models...") end
@@ -2708,6 +2753,7 @@ local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgres
         return prepared
     end
 
+    local mixedOrder=mix and shuffledEggOrder(mix,count) or nil
     local spawnSlice=os.clock()
     local made=0
     local lastCols=0
@@ -2722,7 +2768,7 @@ local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgres
         lastCols=cols
         lastRows=rows
         local preferred=name
-        if name=="MIXED" then preferred=mixedEggFor(pattern,mix,row,col,i,rowCols or cols) end
+        if mixedOrder then preferred=mixedOrder[i] end
         local candidates={preferred}
         if mix then
             for _,alternative in ipairs(mix) do
@@ -3508,23 +3554,26 @@ local function spawnSammy()
 end
 
 local function sammyBatchCenter()
-    if SammySpot then return select(1,visibleSpawnFrame(SammySpot)) end
+    if SammySpot then return visibleSpawnFrame(SammySpot) end
     if Sammy and Sammy.Parent then
         local r=Sammy:FindFirstChild("HumanoidRootPart")
         if r then
             local hit=groundHitNear(r.Position,Sammy)
             local p=hit and hit.Position or (r.Position-Vector3.new(0,3,0))
-            return select(1,visibleSpawnFrame(CFrame.new(p)))
+            return visibleSpawnFrame(CFrame.new(p))
         end
     end
-    return select(1,visibleSpawnFrame(nil))
+    return visibleSpawnFrame(nil)
 end
 
 local function spawnSammyBatch(refillOnly)
     local target=DEFAULT_EGG_COUNT
     if not refillOnly then clearSpawnedEggs("SAMMY240") end
 
-    local cf=sammyBatchCenter()
+    local cf,bounds=sammyBatchCenter()
+    -- Convert the measured field centre to its near end, then use the same
+    -- fixed-size, five-column path as the normal spawn button.
+    local startFrame=cf*CFrame.new(0,0,math.max(0,((bounds and bounds.Z) or 0)/2-2))
     for attempt=1,3 do
         local current=countBatch("SAMMY240")
         local need=math.max(0,target-current)
@@ -3532,7 +3581,7 @@ local function spawnSammyBatch(refillOnly)
             return true,"Sammy batch: 100 / 100 eggs."
         end
 
-        local ok,msg=spawnEggs("MIXED",need,200,"DIAGONAL SEQUENCE",cf,"SAMMY240")
+        local ok,msg=spawnEggs("MIXED",need,300,"FIXED FIVE",nil,"SAMMY240",nil,startFrame)
         if not ok and attempt==3 then
             return false,"Sammy batch stopped at "..tostring(countBatch("SAMMY240")).." / 100. "..tostring(msg)
         end
