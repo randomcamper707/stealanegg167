@@ -1400,7 +1400,15 @@ function eggAssetIndex()
                 or (o:IsA("Model") and o:FindFirstChildOfClass("Humanoid"))
             if not skip then
                 if o:IsA("Model") or o:IsA("Folder") or o:IsA("Tool") or o:IsA("BasePart") or o:IsA("StringValue") then
-                    local source=usableEggSource(o,container)
+                    local candidate=eggSpeciesName(o.Name) or n:find("egg",1,true)
+                    if not candidate then
+                        for _,field in ipairs({"EggName","DisplayName","ItemName","Title","Type","PetName","Name"}) do
+                            local value=o:GetAttribute(field)
+                            if value and eggSpeciesName(value) then candidate=true;break end
+                        end
+                    end
+                    if not candidate and o:IsA("StringValue") then candidate=eggSpeciesName(o.Value) end
+                    local source=candidate and usableEggSource(o,container) or nil
                     local score=source and eggSourceScore(source,container)
                     if score then
                         score=score+(container==ReplicatedStorage and 5 or 0)
@@ -1672,22 +1680,11 @@ MapName="Not detected"
 MapMarker=nil
 
 function updateMapMarker()
-    if MapMarker then MapMarker:Destroy(); MapMarker=nil end
-    if not MapCF then return end
-    local m=Instance.new("Part")
-    m.Name="SAE_MapCenterMarker"
-    m.Size=Vector3.new(5,.08,5)
-    m.Anchored=true
-    m.CanCollide=false
-    m.CanTouch=false
-    m.CanQuery=false
-    m.Material=Enum.Material.Neon
-    m.Color=Color3.fromRGB(170,80,255)
-    m.Transparency=.72
-    m.CFrame=CFrame.new(MapCF.Position+Vector3.new(0,.08,0))
-    m.Parent=workspace
-    MapMarker=m
+    if MapMarker then MapMarker:Destroy();MapMarker=nil end
+    local old=workspace:FindFirstChild("SAE_MapCenterMarker")
+    if old then old:Destroy() end
 end
+updateMapMarker()
 
 function reservedZoneName(value)
     local n=norm(value)
@@ -2405,8 +2402,9 @@ function eggGroundHeight(pos,referenceY,strict)
         local part=hit.Instance
         local flat=not hit.Normal or hit.Normal.Y>=.85
         local floorShape=not part or not part:IsA("BasePart") or
-            (part.Size.X>=12 and part.Size.Z>=12 and part.Size.Y<=18
-                and math.abs(part.CFrame.UpVector.Y)>=.8)
+            (math.abs(part.CFrame.UpVector.Y)>=.8 and
+                ((part.Size.X>=12 and part.Size.Z>=12)
+                    or (part.CanCollide and math.abs(hit.Position.Y-referenceY)<=2.5)))
         if flat and floorShape and math.abs(hit.Position.Y-referenceY)<=12 then return hit.Position.Y end
         if not part then break end
         table.insert(excluded,part)
@@ -2504,7 +2502,8 @@ local function playerEggRegion(startFrame,requiredDepth)
 end
 
 local EggBatchBusy=false
-local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgress,startFrame)
+local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgress,startFrame,beforePlacement)
+    if onProgress then onProgress(0,count,"Preparing egg models...") end
     local mix=nil
     if name=="MIXED" then
         mix=availableEggs()
@@ -2518,7 +2517,7 @@ local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgres
 
     count=math.clamp(math.floor(tonumber(count) or DEFAULT_EGG_COUNT),1,DEFAULT_EGG_COUNT)
     local active=0
-    for egg in pairs(EggState) do if egg.Parent then active=active+1 end end
+    if not beforePlacement then for egg in pairs(EggState) do if egg.Parent then active=active+1 end end end
     local availableSlots=DEFAULT_EGG_COUNT-active
     if availableSlots<=0 then return false,"The 100-egg limit is reached. Clear the current eggs before spawning more." end
     count=math.min(count,availableSlots)
@@ -2550,6 +2549,7 @@ local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgres
     local footprintX=baseFootX*visualScale
     local footprintZ=baseFootZ*visualScale
 
+    if onProgress then onProgress(0,count,"Checking the floor and walls...") end
     local baseCF,bounds
     if startFrame then baseCF,bounds=playerEggRegion(startFrame,math.ceil(count/3)*(footprintZ+1)+4) else baseCF,bounds=visibleSpawnFrame(customCF,count,pattern,size) end
     if not baseCF or not bounds then return false,"No usable floor ahead. Face along the corridor and try again." end
@@ -2611,12 +2611,15 @@ local function buildEggBatch(name,count,size,pattern,customCF,batchTag,onProgres
         return pos,row,col,cols,rows,sx,sz,rowCols
     end
 
+    if onProgress then onProgress(0,count,"Positioning the egg rows...") end
     local groundHeights={}
     for i=1,count do
         local wanted=batchPosition(i)
         groundHeights[i]=eggGroundHeight(wanted,baseY)
         if i%25==0 then task.wait() end
     end
+
+    if beforePlacement then beforePlacement() end
 
     -- Scale and measure each distinct species once, not every placed copy.
     local batchTemplates={}
@@ -4115,7 +4118,7 @@ local function showAdminPage(name,push)
     Nav.Visible=(name~="Home")
     -- Size each branch to its controls instead of leaving a tall empty window.
     local heights={
-        Home=172, ["Spawn eggs"]=300,
+        Home=172, ["Spawn eggs"]=350,
         Announcements=312, Preset=336,
         Names=286, ["Avatar Name"]=330, ["Announcements Profile"]=384
     }
@@ -4215,42 +4218,61 @@ local clearEggBtn=button(EggsPage,"Clear eggs",UDim2.new(.5,4,0,148),UDim2.new(.
 local spawnStatus=label(EggsPage,"Starts at your position and continues forward.",UDim2.fromOffset(5,190),UDim2.new(1,-10,0,36),11)
 spawnStatus.TextWrapped=true; spawnStatus.TextColor3=C.muted
 local EggSpawnBusy=false
-spawnBtn.MouseButton1Click:Connect(function()
-    if EggSpawnBusy or EggBatchBusy then return end
+local function spawnFeedback(text,color)
+    spawnStatus.Text=text;spawnStatus.TextColor3=color or C.muted
+end
+spawnBtn.Activated:Connect(function()
+    if EggSpawnBusy then return end
     EggSpawnBusy=true
-    local startedAt=os.clock()
-    local ok,err=pcall(function()
     spawnBtn.Text="SPAWNING..."
-    local en="MIXED"
-    local root=P.Character and P.Character:FindFirstChild("HumanoidRootPart")
-    if not root then error("Character is not ready") end
-    local look=Vector3.new(root.CFrame.LookVector.X,0,root.CFrame.LookVector.Z)
-    if look.Magnitude<.01 then look=Vector3.new(0,0,-1) else look=look.Unit end
-    local humanoid=P.Character:FindFirstChildOfClass("Humanoid")
-    local floorY=root.Position.Y-(humanoid and humanoid.HipHeight or 2)-root.Size.Y/2
-    floorY=eggGroundHeight(Vector3.new(root.Position.X,floorY,root.Position.Z),floorY)
-    local start=Vector3.new(root.Position.X,floorY,root.Position.Z)
-    local startFrame=CFrame.lookAt(start,start+look)
-    -- Each click is one clean batch, so the default batch contains at most 100 eggs in total.
-    clearSpawnedEggs()
-        local ok,made,cols,rows,fallbacks,appliedScale,typeCount=spawnEggs(en,Amount,EggSize,Pattern,nil,"GENERAL",function(done,total)
-            spawnStatus.Text="Spawning eggs: "..tostring(done).." / "..tostring(total)
-        end,startFrame)
-        if ok then
-            spawnStatus.Text=tostring(made).." mixed eggs spawned in "..string.format("%.1f",os.clock()-startedAt).."s."
-            if en=="MIXED" then spawnStatus.Text=spawnStatus.Text.." "..tostring(typeCount or 0).." egg types." end
-            if appliedScale and appliedScale<EggSize then spawnStatus.Text=spawnStatus.Text.." Scale fitted to "..tostring(appliedScale).." to stay inside the map." end
-            spawnStatus.TextColor3=C.green
+    spawnFeedback("Starting mixed egg batch...",C.purple2)
+    -- Let the button and status render before doing any preparation work.
+    task.spawn(function()
+        task.wait()
+        local startedAt=os.clock()
+        local ok,err=pcall(function()
+            if EggBatchBusy then
+                spawnFeedback("Waiting for the current egg batch...",C.purple2)
+                local waitUntil=os.clock()+15
+                while EggBatchBusy do
+                    if os.clock()>waitUntil then error("Another egg batch is still busy. Try again shortly.",0) end
+                    task.wait(.1)
+                end
+            end
+            local root=P.Character and P.Character:FindFirstChild("HumanoidRootPart")
+            if not root then error("Character is not ready. Wait for your avatar to load.",0) end
+            local look=Vector3.new(root.CFrame.LookVector.X,0,root.CFrame.LookVector.Z)
+            if look.Magnitude<.01 then look=Vector3.new(0,0,-1) else look=look.Unit end
+            local humanoid=P.Character:FindFirstChildOfClass("Humanoid")
+            local floorY=root.Position.Y-(humanoid and humanoid.HipHeight or 2)-root.Size.Y/2
+            floorY=eggGroundHeight(Vector3.new(root.Position.X,floorY,root.Position.Z),floorY)
+            local start=Vector3.new(root.Position.X,floorY,root.Position.Z)
+            local startFrame=CFrame.lookAt(start,start+look)
+            local success,made,cols,rows,fallbacks,appliedScale,typeCount=spawnEggs(
+                "MIXED",Amount,EggSize,Pattern,nil,"GENERAL",
+                function(done,total,stage)
+                    spawnFeedback(stage or ("Spawning eggs: "..tostring(done).." / "..tostring(total)),C.purple2)
+                end,startFrame,function()
+                    spawnFeedback("Replacing the previous egg batch...",C.purple2)
+                    clearSpawnedEggs()
+                end)
+            if not success then error(tostring(made),0) end
+            spawnFeedback(tostring(made).." mixed eggs spawned in "..string.format("%.1f",os.clock()-startedAt).."s. "..tostring(typeCount or 0).." egg types.",C.green)
             notice(P.UserId,Display,": spawned",tostring(made).." EGGS","")
-        else
-            spawnStatus.Text=tostring(made); spawnStatus.TextColor3=C.red
-        end
+        end)
+        EggSpawnBusy=false
+        spawnBtn.Text="Spawn mixed eggs"
+        if not ok then spawnFeedback("Unable to spawn eggs: "..tostring(err),C.red) end
     end)
-    EggSpawnBusy=false
-    spawnBtn.Text="Spawn mixed eggs"
-    if not ok then spawnStatus.Text="Unable to spawn eggs: "..tostring(err); spawnStatus.TextColor3=C.red end
 end)
-clearEggBtn.MouseButton1Click:Connect(function() local n=clearSpawnedEggs(); spawnStatus.Text="Cleared "..n.." spawned egg(s)."; spawnStatus.TextColor3=C.green end)
+clearEggBtn.Activated:Connect(function()
+    if EggSpawnBusy or EggBatchBusy then
+        spawnFeedback("Wait for spawning to finish before clearing eggs.",C.purple2)
+        return
+    end
+    local n=clearSpawnedEggs()
+    spawnFeedback("Cleared "..n.." spawned egg(s).",C.green)
+end)
 
 
 end
