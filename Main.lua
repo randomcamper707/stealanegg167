@@ -3890,7 +3890,7 @@ local function setSafeHere() local r=P.Character and P.Character:FindFirstChild(
 local Bots={}
 
 -- Collector bots are generated locally and do NOT depend on how many real
--- players are in the server. Selecting 1-10 always attempts that exact count.
+-- players are in the server. Waves use four outbound and four return places.
 -- Explicit public avatar sources, independent of server players and friends.
 -- Twelve real accounts, in a strict cycle. Preserve their actual full avatar builds.
 local COLLECTOR_AVATARS={
@@ -3901,12 +3901,29 @@ local BotAvatarModels={}
 local BotAvatarLoading={}
 local CollectorAvatarSerial=0
 local CollectorAvatarCursor=0
+local CollectorAvatarReservations={}
+local CollectorAvatarLeases=setmetatable({},{__mode="k"})
+local function reserveCollectorAvatar(model,key,lease)
+    CollectorAvatarReservations[key]=lease;CollectorAvatarLeases[model]=lease
+    model.Destroying:Connect(function()
+        if CollectorAvatarReservations[key]==lease then CollectorAvatarReservations[key]=nil end
+        CollectorAvatarLeases[model]=nil
+    end)
+end
 local function botAvatar(_)
     if not Gui.Parent then return nil end
-    CollectorAvatarCursor=CollectorAvatarCursor%#COLLECTOR_AVATARS+1
-    local name=COLLECTOR_AVATARS[CollectorAvatarCursor]
-    while BotAvatarLoading[name] and Gui.Parent do task.wait(.05) end
-    if not Gui.Parent then return nil end
+    local name,key
+    for _=1,#COLLECTOR_AVATARS do
+        CollectorAvatarCursor=CollectorAvatarCursor%#COLLECTOR_AVATARS+1
+        local candidate=COLLECTOR_AVATARS[CollectorAvatarCursor]
+        local candidateKey=candidate:lower()
+        if not CollectorAvatarReservations[candidateKey] and not BotAvatarLoading[candidate] then
+            name=candidate;key=candidateKey;break
+        end
+    end
+    if not name then return nil end
+    local lease={}
+    CollectorAvatarReservations[key]=lease
     local template=BotAvatarModels[name]
     if not template then
         BotAvatarLoading[name]=true
@@ -3928,12 +3945,21 @@ local function botAvatar(_)
             return avatar
         end)
         BotAvatarLoading[name]=nil
-        if not ok then warn("[SAE] Collector avatar "..name..": "..tostring(result));return nil end
-        if not Gui.Parent then result:Destroy();return nil end
+        if not ok then
+            if CollectorAvatarReservations[key]==lease then CollectorAvatarReservations[key]=nil end
+            warn("[SAE] Collector avatar "..name..": "..tostring(result));return nil
+        end
+        if not Gui.Parent then
+            result:Destroy()
+            if CollectorAvatarReservations[key]==lease then CollectorAvatarReservations[key]=nil end
+            return nil
+        end
         template=result;BotAvatarModels[name]=template
     end
     CollectorAvatarSerial+=1
-    local model=template:Clone()
+    local cloned,model=pcall(function() return template:Clone() end)
+    if not cloned or not model then CollectorAvatarReservations[key]=nil;return nil end
+    reserveCollectorAvatar(model,key,lease)
     model:SetAttribute("CollectorAvatarSource",name)
     model:SetAttribute("CollectorUsername",name)
     model:SetAttribute("CollectorDisplayName",name)
@@ -4131,7 +4157,7 @@ end
 local CollectorGeneration=0
 local CollectorOrigin=nil
 local CollectorDirection=Vector3.new(0,0,-1)
-local CollectorSlots=2
+local CollectorSlots=4
 local CollectorPending=0
 local CollectorPendingSlots={}
 local CollectorReady={}
@@ -4168,10 +4194,23 @@ local function stopCollectors()
     end
 end
 
+local function collectorCounts()
+    local total,outbound,inbound=0,0,0
+    for _,bot in ipairs(Bots) do
+        if bot.model and bot.model.Parent then
+            total+=1
+            if bot.inbound or bot.returning or bot.replacing then inbound+=1 else outbound+=1 end
+        end
+    end
+    return total,outbound,inbound
+end
+
 local botBrain
 local requestCollector
 local function createCollector(home,direction,slot,generation,arrivingModel,landingPosition)
     if generation~=CollectorGeneration or not CollectorsEnabled then return nil end
+    local total,outbound=collectorCounts()
+    if total>=8 or outbound>=4 then return nil end
     local ok,m=pcall(function()
         if arrivingModel then return arrivingModel end
         local ready=table.remove(CollectorReady,1)
@@ -4179,6 +4218,15 @@ local function createCollector(home,direction,slot,generation,arrivingModel,land
     end)
     if not ok or not m then return nil end
     if generation~=CollectorGeneration or not CollectorsEnabled then m:Destroy();return nil end
+    local total,outbound=collectorCounts()
+    if total>=8 or outbound>=4 then m:Destroy();return nil end
+    local appearance=m:GetAttribute("CollectorUsername") or m:GetAttribute("CollectorAvatarSource")
+    if appearance then
+        local key=appearance:lower()
+        local lease=CollectorAvatarLeases[m]
+        if CollectorAvatarReservations[key] and CollectorAvatarReservations[key]~=lease then m:Destroy();return nil end
+        if not lease then reserveCollectorAvatar(m,key,{}) end
+    end
     local h=m:FindFirstChildOfClass("Humanoid")
     local r=m:FindFirstChild("HumanoidRootPart")
     if not h or not r then m:Destroy();return nil end
@@ -4194,7 +4242,7 @@ local function createCollector(home,direction,slot,generation,arrivingModel,land
     end
     local tr=TRAILS[math.random(1,arrlen(TRAILS))]
     local stat=math.random(200,270)*1000000
-    local speed=72+((stat-200000000)/70000000)*22
+    local speed=100+((stat-200000000)/70000000)*22
     h.WalkSpeed=speed
     placeNPC(m,home,direction)
     local returnHome=r.Position
@@ -4219,9 +4267,8 @@ end
 
 requestCollector=function(slot,generation)
     if generation~=CollectorGeneration or not CollectorsEnabled then return end
-    -- Returning carriers can overlap outbound collectors, with a generous
-    -- upper bound to avoid runaway models if movement becomes blocked.
-    if #Bots+CollectorPending>=34 or CollectorPendingSlots[slot] then return false end
+    local total,outbound=collectorCounts()
+    if total+CollectorPending>=8 or outbound+CollectorPending>=4 or CollectorPendingSlots[slot] then return false end
     CollectorPending=CollectorPending+1
     CollectorPendingSlots[slot]=true
     task.spawn(function()
@@ -4239,40 +4286,41 @@ requestCollector=function(slot,generation)
 end
 
 local function startCollectorStream(generation)
-    -- Prepare a few different avatars ahead of pickup, rather than making
-    -- the next departure wait for a remote avatar load.
-    for _=1,1 do
-        task.spawn(function()
-            while generation==CollectorGeneration and CollectorsEnabled do
-                if #CollectorReady<math.min(6,CollectorSlots+1) then
-                    local ok,model=pcall(function() return botAvatar(0) end)
-                    if ok and model then
-                        if generation==CollectorGeneration and CollectorsEnabled then
-                            table.insert(CollectorReady,model)
-                        else model:Destroy() end
-                    end
-                end
-                task.wait(.05)
-            end
-        end)
-    end
+    -- Reserve different appearances ahead of departure, including queued models.
     task.spawn(function()
-        local nextDeparture=os.clock()
-        local slot=1
         while generation==CollectorGeneration and CollectorsEnabled do
-            if os.clock()>=nextDeparture then
-                -- Depart independently of pickup and return times. One new
-                -- collector every 4.3 seconds reduces traffic by 30%.
-                local available=nearestEgg(CollectorOrigin,"BOT_STREAM_LOOK")
-                if available and requestCollector(slot,generation) then
-                    nextDeparture=os.clock()+(3/.7)
-                    slot=slot%CollectorSlots+1
+            if #CollectorReady<4 then
+                local ok,model=pcall(function() return botAvatar(0) end)
+                if ok and model then
+                    if generation==CollectorGeneration and CollectorsEnabled then
+                        table.insert(CollectorReady,model)
+                    else model:Destroy() end
                 end
             end
-            task.wait(.05)
+            task.wait(.1)
+        end
+    end)
+    task.spawn(function()
+        local nextWave=0
+        while generation==CollectorGeneration and CollectorsEnabled do
+            local total,outbound=collectorCounts()
+            -- A new group leaves only after the last outbound group has picked up.
+            -- Its returning partners may still be on the way home: 4 out, 4 back.
+            if os.clock()>=nextWave and CollectorPending==0 and outbound==0 and total<=4 then
+                local eggs=0
+                for egg,state in pairs(EggState) do
+                    if egg.Parent and not state.carried and not state.delivered and not state.claim then eggs+=1 end
+                    if eggs>=4 then break end
+                end
+                local count=math.min(4,8-total,eggs)
+                for slot=1,count do requestCollector(slot,generation) end
+                if count>0 then nextWave=os.clock()+.8 end
+            end
+            task.wait(.08)
         end
     end)
 end
+
 
 botBrain=function(d)
     task.spawn(function()
@@ -4281,7 +4329,7 @@ botBrain=function(d)
         local lastDistance=nil
         local stuckSince=os.clock()
         while d.model and d.model.Parent do
-            task.wait(.12)
+            task.wait(.08)
             local m=d.model
             local h=m:FindFirstChildOfClass("Humanoid")
             local r=m:FindFirstChild("HumanoidRootPart")
@@ -4357,7 +4405,10 @@ botBrain=function(d)
                         moveCollector(d,h,r,position)
                         local hd=horizontalDistance(r.Position,position)
                         if hd<=12 then
-                            if carryEgg(target,r,d.key,m) then
+                            if select(3,collectorCounts())>=4 then
+                                h:MoveTo(r.Position);d.navigation=nil
+                                stuckSince=os.clock();lastDistance=nil
+                            elseif carryEgg(target,r,d.key,m) then
                                 carried=target
                                 d.inbound=true
                                 target=nil
@@ -4395,7 +4446,7 @@ botBrain=function(d)
     end)
 end
 
-local function spawnBots(n)
+local function spawnBots(n,deferDepartures)
     local root=P.Character and P.Character:FindFirstChild("HumanoidRootPart")
     if not root then return false,"Wait for your character to load." end
     local origin=safePosition()
@@ -4408,15 +4459,15 @@ local function spawnBots(n)
     clearBots()
     CollectorAvatarCursor=0
     CollectorOrigin=origin
-    CollectorSlots=math.clamp(n,1,10)
+    CollectorSlots=4
     local nearest=nearestEgg(origin,"BOT_SPAWN_LOOK")
     local target=nearest and eggPickupPosition(nearest)
     local dir=target and (target-origin) or root.CFrame.LookVector
     dir=Vector3.new(dir.X,0,dir.Z)
     CollectorDirection=dir.Magnitude>.1 and dir.Unit or Vector3.new(0,0,-1)
     CollectorsEnabled=true
-    startCollectorStream(CollectorGeneration)
-    return true,"Collectors running continuously."
+    if not deferDepartures then startCollectorStream(CollectorGeneration) end
+    return true,"Collectors running: four out, four back (eight maximum)."
 end
 
 -- A console teleport brings the requested avatar in as a local collector.
@@ -4424,11 +4475,16 @@ end
 local TeleportArrivalBusy=false
 local function teleportCollector(account,onError)
     if TeleportArrivalBusy then return false,"A player is loading. Try again in a moment." end
+    local total,outbound=collectorCounts()
+    if total+CollectorPending>=8 or outbound+CollectorPending>=4 then return false,"All collector places are busy. Wait for a group to return." end
+    if CollectorAvatarReservations[account.name:lower()] then return false,"That avatar is already collecting or queued. Wait for it to return." end
     local playerRoot=P.Character and P.Character:FindFirstChild("HumanoidRootPart")
     if not playerRoot then return false,"Wait for your character to load." end
+    local startStreamAfterArrival=false
     if not CollectorsEnabled then
-        local ok,message=spawnBots(2)
+        local ok,message=spawnBots(4,true)
         if not ok then return false,message end
+        startStreamAfterArrival=true
     end
     local generation=CollectorGeneration
     local direction=Vector3.new(playerRoot.CFrame.LookVector.X,0,playerRoot.CFrame.LookVector.Z)
@@ -4445,7 +4501,10 @@ local function teleportCollector(account,onError)
             ground=hit.Position;break
         end
     end
-    if not ground then return false,"No clear place nearby to spawn that player." end
+    if not ground then
+        if startStreamAfterArrival then startCollectorStream(generation) end
+        return false,"No clear place nearby to spawn that player."
+    end
     TeleportArrivalBusy=true
     task.spawn(function()
         local model
@@ -4478,6 +4537,7 @@ local function teleportCollector(account,onError)
         end,debug.traceback)
         if model and not imported then model:Destroy() end
         TeleportArrivalBusy=false
+        if startStreamAfterArrival and active() then startCollectorStream(generation) end
         if not ok and active() then
             warn("[SAE] Player spawn: "..tostring(err))
             if onError then onError("Could not spawn that player. Try again.") end
@@ -5205,7 +5265,7 @@ collectorsToggle.MouseButton1Click:Connect(function()
         stopCollectors(); collectorInfo.Text="Collectors are returning home."; collectorInfo.TextColor3=C.muted; collectorsToggle.Text="COLLECTORS: OFF"; collectorsToggle:SetAttribute("RestingColor",C.card2)
     else
         if arrlen(Bots)==0 or Bots[1].returning then local ok,msg=spawnBots(NPCCount); if not ok then collectorInfo.Text=msg; collectorInfo.TextColor3=C.red; return end else CollectorsEnabled=true end
-        collectorsToggle.Text="COLLECTORS: ON"; collectorsToggle:SetAttribute("RestingColor",C.purple); collectorInfo.Text="One collector leaves every 3 seconds."; collectorInfo.TextColor3=C.green
+        collectorsToggle.Text="COLLECTORS: ON"; collectorsToggle:SetAttribute("RestingColor",C.purple); collectorInfo.Text="Four out, four back. Eight collectors maximum."; collectorInfo.TextColor3=C.green
     end
 end)
 clearNPCBtn.MouseButton1Click:Connect(function() clearBots(); collectorsToggle.Text="COLLECTORS: OFF"; collectorsToggle:SetAttribute("RestingColor",C.card2); collectorInfo.Text="NPCs cleared."; collectorInfo.TextColor3=C.muted end)
@@ -7139,6 +7199,27 @@ local function createTreadmillRuntime()
         if state.track then pcall(function() state.track:Play(.18,1,1.35) end) end
     end
 
+    local function touchingEntry(entry,character)
+        if not entry.sensor or not entry.sensor.Parent or not character then return false end
+        local params=OverlapParams.new()
+        params.FilterType=Enum.RaycastFilterType.Include
+        params.FilterDescendantsInstances={character}
+        params.RespectCanCollide=false;params.MaxParts=1
+        return #workspace:GetPartsInPart(entry.sensor,params)>0
+    end
+    local function tryContactMount(entry,hit)
+        if dead or active or not entry.model.Parent or not entry.model:GetAttribute('SAE_PLACED_TREADMILL') then return false end
+        local character=P.Character
+        -- NPCs, other players, tools on the floor, and their accessories cannot mount.
+        if not character or not hit or not hit:IsDescendantOf(character) then return false end
+        local root=character:FindFirstChild('HumanoidRootPart')
+        local humanoid=character:FindFirstChildOfClass('Humanoid')
+        if not root or not humanoid or humanoid.Health<=0 or root.Anchored or humanoid.Sit
+            or os.clock()<cooldown or dismounted==entry.model then return false end
+        startRunning(entry,character,humanoid,root)
+        return active~=nil
+    end
+
     function api:Watch(model)
         if dead or entries[model] or not model:GetAttribute('SAE_TREADMILL') then return end
         local belt=model:FindFirstChild('RunningBelt',true)
@@ -7238,6 +7319,15 @@ local function createTreadmillRuntime()
         end
         entries[model]=entry
         if model:GetAttribute('SAE_PLACED_TREADMILL') then
+            local oldSensor=model:FindFirstChild('SAE_TREADMILL_CONTACT')
+            if oldSensor then oldSensor:Destroy() end
+            local contactFrame,contactSize=model:GetBoundingBox()
+            local sensor=Instance.new('Part')
+            sensor.Name='SAE_TREADMILL_CONTACT';sensor.Size=contactSize+Vector3.new(.12,.12,.12)
+            sensor.CFrame=contactFrame;sensor.Anchored=true;sensor.Transparency=1
+            sensor.CanCollide=false;sensor.CanTouch=true;sensor.CanQuery=false;sensor.CastShadow=false
+            sensor.Parent=model;entry.sensor=sensor
+            connect(sensor.Touched,function(hit) tryContactMount(entry,hit) end)
             belt.CanCollide=true belt.CanQuery=true
             local ramp=model:FindFirstChild('SAE_TREADMILL_ENTRY_RAMP')
             if not ramp then
@@ -7261,6 +7351,9 @@ local function createTreadmillRuntime()
     for _,folder in ipairs(workspace:GetChildren()) do watchFolder(folder) end
     connect(workspace.ChildAdded,watchFolder)
     connect(UIS.JumpRequest,function() if active then stopRunning(true) end end)
+    connect(UIS.InputBegan,function(input,processed)
+        if not processed and input.KeyCode==Enum.KeyCode.Space and active then stopRunning(true) end
+    end)
     connect(P.CharacterRemoving,function() stopRunning(false) end)
     local function poseRunner(state,now)
         if state.track and state.track.IsPlaying and state.track.Length>0 then return end
@@ -7383,29 +7476,12 @@ local function createTreadmillRuntime()
         sample=0
         if now<cooldown or not root or not humanoid or humanoid.Health<=0 or humanoid.Sit or root.Anchored then return end
         if dismounted then
-            if not dismounted.Parent then dismounted=nil
-            else
-                local p=dismounted:GetPivot():PointToObjectSpace(root.Position)
-                local scale=dismounted:GetAttribute('SAE_TREADMILL_MODEL_SCALE') or 1
-                if math.abs(p.X)>2.05*scale or p.Z<-3*scale or p.Z>4.6*scale then dismounted=nil end
-            end
+            local entry=entries[dismounted]
+            if not dismounted.Parent or not entry or not touchingEntry(entry,character) then dismounted=nil end
         end
-        local leg=humanoid.RigType==Enum.HumanoidRigType.R6 and character:FindFirstChild('Left Leg')
-        local standing=humanoid.HipHeight+root.Size.Y*.5+(leg and leg.Size.Y or 0)
         for model,entry in pairs(entries) do
-            if model~=dismounted and model:GetAttribute('SAE_PLACED_TREADMILL') then
-                local localPos=model:GetPivot():PointToObjectSpace(root.Position)
-                local scale=model:GetAttribute('SAE_TREADMILL_MODEL_SCALE') or 1
-                local beltY=.49*scale+standing
-                local centred=math.abs(localPos.X)<.60*scale and math.abs(localPos.Z-.40*scale)<1.2*scale
-                    and math.abs(localPos.Y-beltY)<.35 and humanoid.FloorMaterial~=Enum.Material.Air
-                if centred then
-                    entry.mountSince=entry.mountSince or now
-                    if now-entry.mountSince>=.25 then
-                        startRunning(entry,character,humanoid,root)
-                        break
-                    end
-                else entry.mountSince=nil end
+            if model~=dismounted and model:GetAttribute('SAE_PLACED_TREADMILL') and touchingEntry(entry,character) then
+                if tryContactMount(entry,root) then break end
             end
         end
     end)
@@ -7413,7 +7489,10 @@ local function createTreadmillRuntime()
         if dead then return end
         dead=true stopRunning(false)
         for _,connection in ipairs(connections) do connection:Disconnect() end
-        for _,entry in pairs(entries) do if entry.plane.Parent then entry.plane:Destroy() end end
+        for _,entry in pairs(entries) do
+            if entry.plane.Parent then entry.plane:Destroy() end
+            if entry.sensor and entry.sensor.Parent then entry.sensor:Destroy() end
+        end
         for _,track in pairs(tracks) do pcall(function() track:Stop(0); track:Destroy() end) end
         for _,popup in ipairs(popups) do popup.gui:Destroy() end
     end
