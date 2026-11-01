@@ -1362,33 +1362,76 @@ function eggSourceScore(source,container)
     return score>0 and score or nil
 end
 
+-- Share one incremental asset scan across all species and repeated clicks.
+local EggAssetIndex=nil
+local EggAssetIndexAt=0
+local EggWorkDeadline=0
+function eggWorkYield()
+    if os.clock()>=EggWorkDeadline then
+        task.wait()
+        EggWorkDeadline=os.clock()+.002
+    end
+end
+
+function eggAssetIndex()
+    if EggAssetIndex and os.clock()-EggAssetIndexAt<30 then return EggAssetIndex end
+    local index={byName={},sources={}}
+    local seen={}
+    local function record(value,source,score)
+        local n=norm(value)
+        if n=="" then return end
+        for _,key in ipairs({n,(n:gsub("model$",""):gsub("template$",""))}) do
+            local old=index.byName[key]
+            if not old or score>old.score then index.byName[key]={source=source,score=score} end
+        end
+    end
+    for _,container in ipairs({ReplicatedStorage,workspace}) do
+        local stack=container:GetChildren()
+        while #stack>0 do
+            local o=table.remove(stack)
+            local n=norm(o.Name)
+            local skip=o==EggFolder or o==NPCFolder or o==P.Character or o.Name=="SAE_V7_PLACED"
+                or n=="pets" or n=="petmodels" or n=="petassets" or n=="pettemplates"
+                or (o:IsA("Model") and o:FindFirstChildOfClass("Humanoid"))
+            if not skip then
+                if o:IsA("Model") or o:IsA("Folder") or o:IsA("Tool") or o:IsA("BasePart") or o:IsA("StringValue") then
+                    local source=usableEggSource(o,container)
+                    local score=source and eggSourceScore(source,container)
+                    if score then
+                        score=score+(container==ReplicatedStorage and 5 or 0)
+                        if not seen[source] then
+                            seen[source]=true
+                            table.insert(index.sources,source)
+                        end
+                        if o==source or eggSpeciesName(o.Name) or n:find("egg",1,true) then record(o.Name,source,score+20) end
+                        for _,attribute in ipairs({"EggName","DisplayName","ItemName","Title","Type","PetName","Name"}) do
+                            local value=o:GetAttribute(attribute)
+                            if value~=nil then record(value,source,score) end
+                        end
+                        if o:IsA("StringValue") then record(o.Value,source,score) end
+                    end
+                end
+                for _,child in ipairs(o:GetChildren()) do table.insert(stack,child) end
+            end
+            eggWorkYield()
+        end
+    end
+    EggAssetIndex=index
+    EggAssetIndexAt=os.clock()
+    return index
+end
+
 function findEgg(name)
     local cached=EggCache[name]
-    if cached and cached.Parent then
-        for _,container in ipairs({ReplicatedStorage,workspace}) do
-            if cached:IsDescendantOf(container) and eggSourceScore(cached,container) then return cached end
-        end
-        EggCache[name]=nil
+    if cached and cached.Parent then return cached end
+    local index=eggAssetIndex()
+    local best=nil
+    for _,alias in ipairs(ALIAS[name] or {name}) do
+        local entry=index.byName[norm(alias)]
+        if entry and entry.source.Parent and (not best or entry.score>best.score) then best=entry end
     end
-
-    local want={}
-    for _,a in ipairs(ALIAS[name] or {name}) do want[norm(a)]=true end
-    local best,bestScore=nil,-1
-    for _,container in ipairs({ReplicatedStorage,workspace}) do
-        for _,o in ipairs(container:GetDescendants()) do
-            if not o:IsDescendantOf(EggFolder) and matchObj(o,want) then
-                local source=usableEggSource(o,container)
-                local score=eggSourceScore(source,container)
-                if score then
-                    if want[norm(o.Name)] then score=score+20 end
-                    if container==ReplicatedStorage then score=score+5 end
-                    if score>bestScore then best,bestScore=source,score end
-                end
-            end
-        end
-    end
-    EggCache[name]=best
-    return best
+    EggCache[name]=best and best.source or nil
+    return EggCache[name]
 end
 
 -- Build a stripped visual template from the REAL egg object already replicated by the game.
@@ -1399,6 +1442,7 @@ EggTemplateCache={}
 function stripEggTemplate(o)
     local remove={}
     for _,x in ipairs(o:GetDescendants()) do
+        eggWorkYield()
         if x:IsA("Script") or x:IsA("LocalScript") or x:IsA("ModuleScript")
             or x:IsA("ProximityPrompt") or x:IsA("ClickDetector")
             or x:IsA("Humanoid") or x:IsA("Animator")
@@ -1423,6 +1467,7 @@ function stripEggTemplate(o)
             x.CanQuery=false
             x.Massless=true
             x.CastShadow=false
+            if x:IsA("MeshPart") then pcall(function() x.RenderFidelity=Enum.RenderFidelity.Performance end) end
         end
     end
     for _,x in ipairs(remove) do pcall(function() x:Destroy() end) end
@@ -1435,6 +1480,7 @@ function eggVisualBounds(o)
     local found=false
     local parts=o:IsA("BasePart") and {o} or o:GetDescendants()
     for _,p in ipairs(parts) do
+        eggWorkYield()
         if p:IsA("BasePart") and p.Transparency<.95 then
             found=true
             local half=p.Size/2
@@ -1454,7 +1500,7 @@ end
 function cloneWholeEgg(source)
     local changed={}
     local nodes={source}
-    for _,node in ipairs(source:GetDescendants()) do table.insert(nodes,node) end
+    for _,node in ipairs(source:GetDescendants()) do table.insert(nodes,node); eggWorkYield() end
     for _,node in ipairs(nodes) do
         if node.Archivable==false then
             table.insert(changed,node)
@@ -1533,24 +1579,19 @@ function availableEggs()
         end
     end
     for i=2,arrlen(EGGS) do add(EGGS[i],findEgg(EGGS[i])) end
-    for _,container in ipairs({ReplicatedStorage,workspace}) do
-        for _,o in ipairs(container:GetDescendants()) do
-            if o:IsA("Model") or o:IsA("Folder") or o:IsA("Tool") or o:IsA("BasePart") then
-                local source=usableEggSource(o,container)
-                if source and not seen[source] and eggSourceScore(source,container) then
-                    local name=source:GetAttribute("EggName") or source.Name
-                    local n=norm(name)
-                    -- Discover whole named eggs, not generic nests, shells or effects.
-                    if n~="egg" and n~="eggs" and n~="eggshell" and n~="eggnest" and n~="eggbase"
-                        and n~="eggfx" and n~="eggvfx" and n~="eggstand" and n~="eggpart"
-                        and n:find("egg",1,true) and not eggAssetCollection(source)
-                        and (not EggCache[name] or EggCache[name]==source) then
-                        EggCache[name]=source
-                        add(name,source)
-                    end
-                end
+    for _,source in ipairs(eggAssetIndex().sources) do
+        if source.Parent and not seen[source] then
+            local name=source:GetAttribute("EggName") or source.Name
+            local n=norm(name)
+            if n~="egg" and n~="eggs" and n~="eggshell" and n~="eggnest" and n~="eggbase"
+                and n~="eggfx" and n~="eggvfx" and n~="eggstand" and n~="eggpart"
+                and n:find("egg",1,true) and not eggAssetCollection(source)
+                and (not EggCache[name] or EggCache[name]==source) then
+                EggCache[name]=source
+                add(name,source)
             end
         end
+        eggWorkYield()
     end
     return available
 end
@@ -1632,6 +1673,7 @@ function detectMapCenter()
     -- the player an unbeatable score, which meant standing in the Safe Zone
     -- could make the Safe Zone itself become "the map".
     for _,o in ipairs(workspace:GetDescendants()) do
+        eggWorkYield()
         if o:IsA("BasePart") and not o:IsDescendantOf(EggFolder) and not o:IsDescendantOf(NPCFolder) then
             local belongsToSafe=SafeObj and (o==SafeObj or (SafeObj:IsA("Model") and o:IsDescendantOf(SafeObj)))
             local base=belongsToSafe and -1 or floorCandidateScore(o)
@@ -1804,7 +1846,7 @@ function findPlayableSpawnFrame()
         local floorVotes={}
 
         for d=startDistance,maxDistance,step do
-            if (d-startDistance)%(step*32)==0 then task.wait() end
+            eggWorkYield()
             local probe=root.Position+dir*d
             local hit=playableGroundHit(Vector3.new(probe.X,root.Position.Y,probe.Z),groundY)
             if hit then
@@ -2400,7 +2442,6 @@ local function spawnEggs(name,count,size,pattern,customCF,batchTag)
         batchTemplates[en]=prepared
         return prepared
     end
-    local sliceStart=os.clock()
 
     local made=0
     local lastCols=0
@@ -2431,10 +2472,7 @@ local function spawnEggs(name,count,size,pattern,customCF,batchTag)
             end)
         end
 
-        if i%4==0 or os.clock()-sliceStart>=.004 then
-            task.wait()
-            sliceStart=os.clock()
-        end
+        task.wait()
     end
     for _,prepared in pairs(batchTemplates) do prepared.template:Destroy() end
 
@@ -2456,7 +2494,7 @@ local function clearSpawnedEggs(batchTag)
             EggState[e]=nil
             pcall(function() e:Destroy() end)
             removed=removed+1
-            if removed%8==0 then task.wait() end
+            task.wait()
         end
     end
     if HeldEgg and not HeldEgg.Parent then HeldEgg=nil; Carry.Visible=false end
@@ -3227,6 +3265,7 @@ end
 detectSafe=function()
     local pr=P.Character and P.Character:FindFirstChild("HumanoidRootPart"); local pp=pr and pr.Position or Vector3.zero; local best=nil; local score=-1e9
     for _,o in ipairs(workspace:GetDescendants()) do
+        eggWorkYield()
         if (o:IsA("BasePart") or o:IsA("Model")) and not o:IsDescendantOf(EggFolder) and not o:IsDescendantOf(NPCFolder) then
             local n=norm(o.Name); local s=0; if n:find("eggdropoff",1,true) then s=7000 elseif n:find("safezone",1,true) then s=6500 elseif n:find("deposit",1,true) then s=6000 elseif n:find("collector",1,true) then s=5200 elseif n:find("playerbase",1,true) then s=4700 elseif n:find("homebase",1,true) then s=4500 elseif n:find("safe",1,true) then s=4000 elseif n:find("base",1,true) then s=2800 elseif n:find("plot",1,true) then s=2500 end
             if s>0 then local p=objPos(o); if p then s=s-(p-pp).Magnitude*.05 end; for _,a in ipairs({"Owner","OwnerName","Player","PlayerName","OwnerId","OwnerUserId","UserId"}) do local v=o:GetAttribute(a); if v and (tostring(v)==P.Name or tostring(v)==P.DisplayName or tonumber(v)==P.UserId) then s=s+5000 end end; if s>score then score=s; best=o end end
