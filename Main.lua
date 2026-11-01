@@ -1120,7 +1120,7 @@ end
 Main=window("MainPanel","DEVELOPER CONTROL PANEL","Main control panel",344,118,UDim2.new(.22,0,.52,0))
 Main.BackgroundTransparency=.12
 Morph=window("MorphPanel","Avatar Morpher","Change your avatar's look",350,360,UDim2.new(.74,0,.28,0))
-local BotsPanel=window("BotPanel","NPC COLLECTORS","Collectors, avatars and Sammy",400,505,UDim2.new(.74,0,.68,0))
+local BotsPanel=window("BotPanel","NPC COLLECTORS","Collectors, avatars and Sammy",340,244,UDim2.new(.74,0,.68,0))
 Morph.BackgroundTransparency=Main.BackgroundTransparency
 BotsPanel.BackgroundTransparency=Main.BackgroundTransparency
 MorphColorsPage=window("MorphColorsPanel","OVERHEAD TEXT COLORS","Choose a text color",350,250,UDim2.new(.74,0,.36,0))
@@ -3978,7 +3978,7 @@ requestCollector=function(slot,generation)
     if generation~=CollectorGeneration or not CollectorsEnabled then return end
     -- Returning carriers can overlap outbound collectors, with a generous
     -- upper bound to avoid runaway models if movement becomes blocked.
-    if #Bots+CollectorPending>=CollectorSlots*4+8 or CollectorPendingSlots[slot] then return end
+    if #Bots+CollectorPending>=48 or CollectorPendingSlots[slot] then return false end
     CollectorPending=CollectorPending+1
     CollectorPendingSlots[slot]=true
     task.spawn(function()
@@ -3992,6 +3992,7 @@ requestCollector=function(slot,generation)
             CollectorPendingSlots[slot]=nil
         end
     end)
+    return true
 end
 
 local function startCollectorStream(generation)
@@ -4013,19 +4014,17 @@ local function startCollectorStream(generation)
         end)
     end
     task.spawn(function()
+        local nextDeparture=os.clock()
+        local slot=1
         while generation==CollectorGeneration and CollectorsEnabled do
-            local outbound=0
-            local usedSlots={}
-            for _,d in ipairs(Bots) do
-                if d.model and d.model.Parent and not d.inbound and not d.replacing and not d.returning then
-                    outbound=outbound+1
-                    usedSlots[d.slot]=true
+            if os.clock()>=nextDeparture then
+                -- Depart independently of pickup and return times. One new
+                -- collector every three seconds spreads the trips out.
+                local available=nearestEgg(CollectorOrigin,"BOT_STREAM_LOOK")
+                if available and requestCollector(slot,generation) then
+                    nextDeparture=os.clock()+3
+                    slot=slot%CollectorSlots+1
                 end
-            end
-            local needed=math.max(0,CollectorSlots-outbound-CollectorPending)
-            for slot=1,CollectorSlots do
-                if needed<=0 then break end
-                if not usedSlots[slot] and not CollectorPendingSlots[slot] then requestCollector(slot,generation);needed=needed-1 end
             end
             task.wait(.05)
         end
@@ -4094,6 +4093,8 @@ botBrain=function(d)
                         if st and st.claim==d.key then st.claim=nil; st.claimTime=nil end
                         target=nil
                         lastDistance=nil
+                    elseif st.claim==d.key then
+                        st.claimTime=os.clock()
                     end
                 end
 
@@ -4116,9 +4117,6 @@ botBrain=function(d)
                             if carryEgg(target,r,d.key,m) then
                                 carried=target
                                 d.inbound=true
-                                -- Dispatch immediately at pickup, while this collector
-                                -- is still on its return trip.
-                                requestCollector(d.slot,d.generation)
                                 target=nil
                                 lastDistance=nil
                             else
@@ -4884,25 +4882,27 @@ end
 local CollectorsPage=newBotPage("Collectors")
 local BotAvatarPage=newBotPage("Avatar")
 local BotSammyPage=newBotPage("Sammy")
-local function showBotPage(n) for k,p in pairs(BotPages) do p.Visible=(k==n) end; for k,b in pairs(BotTabButtons) do b:SetAttribute("RestingColor",(k==n) and C.purple or C.card2) end end
+local function showBotPage(n)
+    local heights={Collectors=244,Avatar=350,Sammy=410}
+    BotsPanel.Size=UDim2.fromOffset(340,heights[n] or 244)
+    for k,p in pairs(BotPages) do p.Visible=(k==n) end; for k,b in pairs(BotTabButtons) do b:SetAttribute("RestingColor",(k==n) and C.purple or C.card2) end end
 for i,n in ipairs({"Collectors","Avatar","Sammy"}) do local b=button(BotTabs,n,UDim2.new((i-1)/3,3*(i-1),0,0),UDim2.new(1/3,-6,0,32),true); BotTabButtons[n]=b; b.MouseButton1Click:Connect(function() showBotPage(n) end) end
 
 -- Collectors tab
 local NPCCount=2
-intSlider(CollectorsPage,8,1,10,1,2,"OUTBOUND COLLECTORS",function(v) NPCCount=v end)
-local collectorsToggle=button(CollectorsPage,"COLLECTORS: OFF",UDim2.fromOffset(0,72),UDim2.new(1,-6,0,38),true)
-local clearNPCBtn=button(CollectorsPage,"Stop / clear NPCs",UDim2.fromOffset(0,117),UDim2.new(1,-6,0,36),true)
-local collectorInfo=label(CollectorsPage,"Eggs: 0 | NPCs: 0",UDim2.fromOffset(5,160),UDim2.new(1,-16,0,28),9); collectorInfo.TextColor3=C.muted
+local collectorsToggle=button(CollectorsPage,"COLLECTORS: OFF",UDim2.fromOffset(0,4),UDim2.new(1,-6,0,32),true)
+local clearNPCBtn=button(CollectorsPage,"Stop / clear NPCs",UDim2.fromOffset(0,42),UDim2.new(1,-6,0,32),true)
+local collectorInfo=label(CollectorsPage,"Eggs: 0 | NPCs: 0",UDim2.fromOffset(5,80),UDim2.new(1,-16,0,28),9); collectorInfo.TextColor3=C.muted
 collectorsToggle.MouseButton1Click:Connect(function()
     if CollectorsEnabled then
         stopCollectors(); collectorInfo.Text="Collectors are returning home."; collectorInfo.TextColor3=C.muted; collectorsToggle.Text="COLLECTORS: OFF"; collectorsToggle:SetAttribute("RestingColor",C.card2)
     else
         if arrlen(Bots)==0 or Bots[1].returning then local ok,msg=spawnBots(NPCCount); if not ok then collectorInfo.Text=msg; collectorInfo.TextColor3=C.red; return end else CollectorsEnabled=true end
-        collectorsToggle.Text="COLLECTORS: ON"; collectorsToggle:SetAttribute("RestingColor",C.purple); collectorInfo.Text="Collectors depart continuously; the next leaves at pickup."; collectorInfo.TextColor3=C.green
+        collectorsToggle.Text="COLLECTORS: ON"; collectorsToggle:SetAttribute("RestingColor",C.purple); collectorInfo.Text="One collector leaves every 3 seconds."; collectorInfo.TextColor3=C.green
     end
 end)
 clearNPCBtn.MouseButton1Click:Connect(function() clearBots(); collectorsToggle.Text="COLLECTORS: OFF"; collectorsToggle:SetAttribute("RestingColor",C.card2); collectorInfo.Text="NPCs cleared."; collectorInfo.TextColor3=C.muted end)
-CollectorsPage.CanvasSize=UDim2.fromOffset(0,204)
+CollectorsPage.CanvasSize=UDim2.fromOffset(0,120)
 
 task.spawn(function()
     while Gui.Parent do
