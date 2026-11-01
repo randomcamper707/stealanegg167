@@ -4469,7 +4469,7 @@ spawnBtn.Activated:Connect(function()
                 end)
             if not success then error(tostring(made),0) end
             spawnFeedback(tostring(made).." mixed eggs spawned in "..string.format("%.1f",os.clock()-startedAt).."s. "..tostring(typeCount or 0).." egg types.",C.green)
-            notice(P.UserId,Display,": spawned",tostring(made).." EGGS","")
+            notice(CFG.AnnouncementProfile.UserId,CFG.AnnouncementProfile.Name,"has spawned",tostring(made).." eggs","",Enum.Font.FredokaOne)
         end)
         EggSpawnBusy=false
         spawnBtn.Text="Spawn mixed eggs"
