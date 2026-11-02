@@ -7020,19 +7020,16 @@ local function createTreadmillRuntime()
         if not state then return end
         active=nil cooldown=os.clock()+.6
         if state.deathConnection then state.deathConnection:Disconnect() end
-        if jump then dismounted=state.entry.model end
-        if state.track then pcall(function() state.track:Stop(.18) end) end
+        dismounted=state.entry.model
+        if state.track then pcall(function() state.track:Stop(0) end) end
         if state.headphones then state.headphones:Destroy() end
         if state.aura then state.aura:Destroy() end
         for _,popup in ipairs(popups) do popup.started=nil popup.gui.Enabled=false end
         for joint,original in pairs(state.joints or {}) do
             if joint.Parent then joint.Transform=original end
         end
-        if state.root.Parent then
-            state.root.Anchored=state.anchored
-            state.root.AssemblyLinearVelocity=Vector3.zero
-            state.root.AssemblyAngularVelocity=Vector3.zero
-        end
+        -- Do not write the root here: a server teleport may own its new position,
+        -- velocity or anchored state. Releasing the treadmill must leave those intact.
         if state.humanoid.Parent then
             state.humanoid.WalkSpeed=state.speed
             state.humanoid.AutoRotate=state.rotate
@@ -7253,7 +7250,7 @@ local function createTreadmillRuntime()
         local toward=position+Vector3.new(cf.LookVector.X,0,cf.LookVector.Z)
         local state={
             entry=entry,character=character,humanoid=humanoid,root=root,
-            anchored=root.Anchored,speed=humanoid.WalkSpeed,rotate=humanoid.AutoRotate,
+            standing=standing,speed=humanoid.WalkSpeed,rotate=humanoid.AutoRotate,
             started=os.clock(),joints={},
         }
         for _,joint in ipairs(character:GetDescendants()) do
@@ -7269,7 +7266,8 @@ local function createTreadmillRuntime()
         local mounted,mountError=pcall(function()
         humanoid.WalkSpeed=0 humanoid.AutoRotate=false
         root.AssemblyLinearVelocity=Vector3.zero root.AssemblyAngularVelocity=Vector3.zero
-        root.Anchored=true
+        -- Stand on the solid belt without anchoring, welding or continuously
+        -- repositioning the live character. The game remains free to move it.
         root.CFrame=CFrame.lookAt(position,toward)
         popupClock=0
         state.deathConnection=humanoid.Died:Connect(function() if active==state then stopRunning(false) end end)
@@ -7283,6 +7281,19 @@ local function createTreadmillRuntime()
             if active==state then stopRunning(false) end
             warn("[SAE] Treadmill mount cancelled safely: "..tostring(mountError))
         end
+    end
+
+    local function runningOnBelt(state)
+        if P.Character~=state.character or not state.character.Parent or
+            not state.root.Parent or not state.humanoid.Parent or state.humanoid.Health<=0 or
+            state.humanoid.Sit or not state.entry.model.Parent or not state.entry.belt.Parent then return false end
+        local belt=state.entry.belt
+        local offset=belt.CFrame:PointToObjectSpace(state.root.Position)
+        local height=belt.Size.Y*.5+state.standing
+        -- Measure against the belt, not the taller full-machine touch sensor.
+        -- Normal physics settling is allowed; leaving the belt ends the run.
+        return math.abs(offset.X)<=belt.Size.X*.5+.35 and
+            math.abs(offset.Z)<=belt.Size.Z*.5+.35 and math.abs(offset.Y-height)<=1.25
     end
 
     local function touchingEntry(entry,character)
@@ -7302,6 +7313,7 @@ local function createTreadmillRuntime()
         local humanoid=character:FindFirstChildOfClass('Humanoid')
         if not root or not humanoid or humanoid.Health<=0 or root.Anchored or humanoid.Sit
             or os.clock()<cooldown or dismounted==entry.model then return false end
+        if not touchingEntry(entry,character) then return false end
         startRunning(entry,character,humanoid,root)
         return active~=nil
     end
@@ -7463,6 +7475,7 @@ local function createTreadmillRuntime()
         end
     end
     connect(Run.PreSimulation,function()
+        if active and not runningOnBelt(active) then stopRunning(false) end
         if active then
             local head=(MorphShell and MorphShell:FindFirstChild("Head")) or active.character:FindFirstChild("Head")
             if active.headphones and active.headphones.Parent and head then active.headphones:PivotTo(head.CFrame) end
@@ -7549,11 +7562,10 @@ local function createTreadmillRuntime()
                 end
             end
         end
+        if active and not runningOnBelt(active) then stopRunning(false) end
         updateSteps(now)
         if active then
-            if active.character~=character or not root or not humanoid or humanoid.Health<=0 or
-                not active.entry.model.Parent or not active.root.Parent then stopRunning(false)
-            else
+            do
                 popupClock-=dt
                 if popupClock<=0 and not (E.SAE_PACKAGE_RUNTIME and E.SAE_PACKAGE_RUNTIME.active) then
                     emitStep(active,now) popupClock=.22
