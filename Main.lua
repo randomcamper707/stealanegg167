@@ -3112,8 +3112,7 @@ end
 
 -- Character tag.
 local TagTextColor=Color3.fromRGB(245,245,250)
-local RoleLabels={OWNER="Owner",["CO-OWNER"]="Co-Owner",ADMIN="Admin",["CONTENT CREATOR"]="Content Creator",DEVELOPER="Developer"}
-local RoleIcons={OWNER="👑",["CO-OWNER"]="👑",ADMIN="⚙️",["CONTENT CREATOR"]="🎬",DEVELOPER="🔨"}
+local RoleLabels={OWNER="[OWNER]",["CO-OWNER"]="[CO-OWNER]",ADMIN="[ADMIN]",["CONTENT CREATOR"]="[CONTENT CREATOR]",DEVELOPER="[DEVELOPER]"}
 local Role="OWNER"; local Display=P.DisplayName; local Username=P.Name
 local consoleJoinLabel
 local TagAdornee=nil
@@ -3146,7 +3145,7 @@ local function applyTag()
     g.AlwaysOnTop=true
     g.Parent=head
 
-    local roleText=RoleLabels[Role] or Role
+    local roleText=RoleLabels[Role] or ("["..tostring(Role):upper().."]")
     local roleHeader=Instance.new("Frame")
     roleHeader.BackgroundTransparency=1
     roleHeader.Size=UDim2.new(1,0,0,27)
@@ -3157,22 +3156,16 @@ local function applyTag()
     roleLayout.VerticalAlignment=Enum.VerticalAlignment.Center
     roleLayout.Padding=UDim.new(0,3)
     roleLayout.Parent=roleHeader
-    local icon=label(roleHeader,RoleIcons[Role] or "",UDim2.new(),UDim2.fromOffset(24,27),20)
-    icon.LayoutOrder=1
-    icon.Font=Enum.Font.GothamBlack
-    icon.TextXAlignment=Enum.TextXAlignment.Center
-    icon.TextColor3=C.white
-    icon.TextStrokeTransparency=1
-    local roleWidth=math.ceil(TextService:GetTextSize(roleText,20,Enum.Font.GothamBlack,Vector2.new(220,27)).X+2)
-    local a=label(roleHeader,roleText,UDim2.new(),UDim2.fromOffset(math.min(205,roleWidth),27),20)
-    a.LayoutOrder=2
+    local roleWidth=math.ceil(TextService:GetTextSize(roleText,20,Enum.Font.GothamBlack,Vector2.new(231,27)).X+2)
+    local a=label(roleHeader,roleText,UDim2.new(),UDim2.fromOffset(math.min(231,roleWidth),27),20)
+    a.LayoutOrder=1
     a.Font=Enum.Font.GothamBlack
     a.TextXAlignment=Enum.TextXAlignment.Left
     a.TextStrokeTransparency=0
     a.TextStrokeColor3=Color3.new(0,0,0)
     a.TextColor3=TagTextColor
     if RoleLabels[Role] then
-        -- The text shine stays on the words; the emoji remains independent of the color picker.
+        -- Keep the existing text shine on the bracketed role label.
         local shine=label(a,roleText,UDim2.new(),UDim2.new(1,0,1,0),20)
         shine.Font=a.Font
         shine.TextXAlignment=Enum.TextXAlignment.Left
@@ -4286,7 +4279,6 @@ requestCollector=function(slot,generation)
 end
 
 local function startCollectorStream(generation)
-    -- Reserve different appearances ahead of departure, including queued models.
     task.spawn(function()
         while generation==CollectorGeneration and CollectorsEnabled do
             if #CollectorReady<4 then
@@ -4301,25 +4293,31 @@ local function startCollectorStream(generation)
         end
     end)
     task.spawn(function()
-        local nextWave=0
+        local nextSlot=1
         while generation==CollectorGeneration and CollectorsEnabled do
             local total,outbound=collectorCounts()
-            -- A new group leaves only after the last outbound group has picked up.
-            -- Its returning partners may still be on the way home: 4 out, 4 back.
-            if os.clock()>=nextWave and CollectorPending==0 and outbound==0 and total<=4 then
+            -- Refill an outbound place as soon as any collector turns back.
+            -- A slow member never holds the other three replacements at home.
+            local places=math.min(4-outbound-CollectorPending,8-total-CollectorPending)
+            if places>0 then
                 local eggs=0
                 for egg,state in pairs(EggState) do
                     if egg.Parent and not state.carried and not state.delivered and not state.claim then eggs+=1 end
-                    if eggs>=4 then break end
+                    if eggs>=places then break end
                 end
-                local count=math.min(4,8-total,eggs)
-                for slot=1,count do requestCollector(slot,generation) end
-                if count>0 then nextWave=os.clock()+.8 end
+                local needed=math.min(places,eggs)
+                local requested=0
+                for _=1,4 do
+                    if requested>=needed then break end
+                    local slot=nextSlot;nextSlot=nextSlot%4+1
+                    if requestCollector(slot,generation) then requested+=1 end
+                end
             end
             task.wait(.08)
         end
     end)
 end
+
 
 
 botBrain=function(d)
@@ -5143,11 +5141,11 @@ local morphOutline=stroke(morphBtn,.3)
 morphOutline.ApplyStrokeMode=Enum.ApplyStrokeMode.Border
 local resetMorphBtn=button(Morph,"RESET",UDim2.new(.62,0,0,158),UDim2.new(.38,-12,0,37),true)
 local roleLabel=label(Morph,"OVERHEAD ROLE",UDim2.fromOffset(12,203),UDim2.new(1,-24,0,16),9); roleLabel.TextColor3=C.muted; roleLabel.Font=Enum.Font.GothamBold
-local morphOwnerRole=button(Morph,"👑 Owner",UDim2.fromOffset(12,224),UDim2.new(1/3,-12,0,30),true); morphOwnerRole.TextSize=9
-local morphCoownerRole=button(Morph,"👑 Co-Owner",UDim2.new(1/3,6,0,224),UDim2.new(1/3,-12,0,30),true); morphCoownerRole.TextSize=9
-local morphAdminRole=button(Morph,"⚙️ Admin",UDim2.new(2/3,0,0,224),UDim2.new(1/3,-12,0,30),true); morphAdminRole.TextSize=9
-local morphCreatorRole=button(Morph,"🎬 Content Creator",UDim2.fromOffset(12,260),UDim2.new(.5,-18,0,30),true); morphCreatorRole.TextSize=9
-local morphDeveloperRole=button(Morph,"🔨 Developer",UDim2.new(.5,6,0,260),UDim2.new(.5,-18,0,30),true); morphDeveloperRole.TextSize=9
+local morphOwnerRole=button(Morph,"[OWNER]",UDim2.fromOffset(12,224),UDim2.new(1/3,-12,0,30),true); morphOwnerRole.TextSize=9
+local morphCoownerRole=button(Morph,"[CO-OWNER]",UDim2.new(1/3,6,0,224),UDim2.new(1/3,-12,0,30),true); morphCoownerRole.TextSize=9
+local morphAdminRole=button(Morph,"[ADMIN]",UDim2.new(2/3,0,0,224),UDim2.new(1/3,-12,0,30),true); morphAdminRole.TextSize=9
+local morphCreatorRole=button(Morph,"[CONTENT CREATOR]",UDim2.fromOffset(12,260),UDim2.new(.5,-18,0,30),true); morphCreatorRole.TextSize=9
+local morphDeveloperRole=button(Morph,"[DEVELOPER]",UDim2.new(.5,6,0,260),UDim2.new(.5,-18,0,30),true); morphDeveloperRole.TextSize=9
 local colorsButton=button(Morph,"COLORS",UDim2.fromOffset(12,300),UDim2.new(1,-24,0,30),true)
 local morphStatus=label(Morph,"Changes your avatar appearance locally.",UDim2.fromOffset(12,337),UDim2.new(1,-24,0,18),10); morphStatus.TextWrapped=true; morphStatus.TextColor3=C.muted
 addRoleSelector(morphOwnerRole,morphCoownerRole,morphAdminRole,morphCreatorRole,morphDeveloperRole,morphStatus)
@@ -5265,7 +5263,7 @@ collectorsToggle.MouseButton1Click:Connect(function()
         stopCollectors(); collectorInfo.Text="Collectors are returning home."; collectorInfo.TextColor3=C.muted; collectorsToggle.Text="COLLECTORS: OFF"; collectorsToggle:SetAttribute("RestingColor",C.card2)
     else
         if arrlen(Bots)==0 or Bots[1].returning then local ok,msg=spawnBots(NPCCount); if not ok then collectorInfo.Text=msg; collectorInfo.TextColor3=C.red; return end else CollectorsEnabled=true end
-        collectorsToggle.Text="COLLECTORS: ON"; collectorsToggle:SetAttribute("RestingColor",C.purple); collectorInfo.Text="Four out, four back. Eight collectors maximum."; collectorInfo.TextColor3=C.green
+        collectorsToggle.Text="COLLECTORS: ON"; collectorsToggle:SetAttribute("RestingColor",C.purple); collectorInfo.Text="Continuous pickups: four out, four back, eight maximum."; collectorInfo.TextColor3=C.green
     end
 end)
 clearNPCBtn.MouseButton1Click:Connect(function() clearBots(); collectorsToggle.Text="COLLECTORS: OFF"; collectorsToggle:SetAttribute("RestingColor",C.card2); collectorInfo.Text="NPCs cleared."; collectorInfo.TextColor3=C.muted end)
