@@ -197,6 +197,8 @@ local function placeTool(tool,model)
     c:PivotTo(CFrame.new(pos))
     local cf,sz=c:GetBoundingBox()
     c:PivotTo(c:GetPivot()+Vector3.new(0,pos.Y-(cf.Position.Y-sz.Y/2)+.08,0))
+    local forget=((getgenv and getgenv()) or _G).SAE_INVENTORY_FORGET
+    if type(forget)=='function' then forget(tool) end
     tool:Destroy()
 end
 
@@ -212,6 +214,7 @@ local function replace(tool)
         if not tool.Parent then busy[tool]=nil return end
         local parent=tool.Parent
         local new=Instance.new('Tool')
+        for key,value in pairs(tool:GetAttributes()) do new:SetAttribute(key,value) end
         new.Name=tool.Name
         new.RequiresHandle=true
         new.CanBeDropped=false
@@ -266,6 +269,9 @@ local function watch(container)
     end
 end
 
+P.ChildAdded:Connect(function(child)
+    if child:IsA('Backpack') then BP=child;watch(child) end
+end)
 watch(BP)
 watch(P.Character)
 P.CharacterAdded:Connect(function(char) task.wait(.2) watch(char) end)
@@ -590,6 +596,7 @@ local function replace(tool)
         if not tool.Parent then busy[tool]=nil return end
         local parent=tool.Parent
         local new=Instance.new('Tool')
+        for key,value in pairs(tool:GetAttributes()) do new:SetAttribute(key,value) end
         new.Name='Star'
         new.RequiresHandle=true
         new.CanBeDropped=false
@@ -633,6 +640,9 @@ local function watch(c)
         if x:IsA('Tool') and x.Name=='Star' then replace(x) end
     end
 end
+P.ChildAdded:Connect(function(child)
+    if child:IsA('Backpack') then BP=child;watch(child) end
+end)
 watch(BP)
 watch(P.Character)
 P.CharacterAdded:Connect(function(c) task.wait(.2) watch(c) end)
@@ -712,6 +722,9 @@ local function watchTools(container)
     end
 end
 
+P.ChildAdded:Connect(function(child)
+    if child:IsA('Backpack') then BP=child;watchTools(child) end
+end)
 watchTools(BP)
 watchTools(P.Character)
 P.CharacterAdded:Connect(function(char) task.wait(.2); watchTools(char) end)
@@ -3263,6 +3276,11 @@ end
 
 -- Client-side appearance. Keep the real character and its controls untouched.
 local MorphShell=nil; local MorphConn=nil; local MorphAnim=nil; local Hidden={}
+local MorphChoice=nil
+local MorphRequest=0
+local MorphRequestChoice=nil
+local MorphUserIds={}
+local MorphTemplates={}
 local MorphDescConn=nil
 local MorphVisibilityBound=false
 local MorphVisibilityStep="SAE_MorphVisibility_"..P.UserId
@@ -3415,11 +3433,22 @@ local function repairAvatarRig(model,root,humanoid)
     return true
 end
 
-local function doMorph(user)
-    local uid
-    if not pcall(function() uid=Players:GetUserIdFromNameAsync(user) end) then return false,"Username not found." end
+local function doMorph(user,expectedCharacter)
+    MorphRequest+=1
+    local request=MorphRequest
+    MorphRequestChoice=user
+    local targetCharacter=expectedCharacter or P.Character
+    local targetHumanoid=targetCharacter and targetCharacter:FindFirstChildOfClass("Humanoid")
+    if not targetHumanoid or targetHumanoid.Health<=0 then return false,"Wait for your character to respawn." end
+    local uid=MorphUserIds[user:lower()]
+    if not uid then
+        if not pcall(function() uid=Players:GetUserIdFromNameAsync(user) end) then return false,"Username not found." end
+        MorphUserIds[user:lower()]=uid
+    end
+    local cacheKey=tostring(uid)..":"..tostring(targetHumanoid.RigType)
     local model
-    if not pcall(function() model=createAvatar(uid) end) or not model then return false,"Avatar could not be created." end
+    if not pcall(function() model=MorphTemplates[cacheKey] and MorphTemplates[cacheKey]:Clone() or createAvatar(uid) end) or not model then return false,"Avatar could not be created." end
+    if request~=MorphRequest or P.Character~=targetCharacter or not Gui.Parent then model:Destroy();return false,"Morph request was superseded." end
 
     local character=P.Character
     local realRoot=character and character:FindFirstChild("HumanoidRootPart")
@@ -3446,6 +3475,8 @@ local function doMorph(user)
         if not root or not humanoid then model:Destroy(); return false,"Matched avatar rig unavailable." end
     end
 
+    if request~=MorphRequest or P.Character~=targetCharacter then model:Destroy();return false,"Character changed during morph." end
+    if not MorphTemplates[cacheKey] then MorphTemplates[cacheKey]=model:Clone() end
     local camera=workspace.CurrentCamera
     if not camera then model:Destroy(); return false,"Camera unavailable." end
     model.PrimaryPart=root
@@ -3657,11 +3688,12 @@ local function doMorph(user)
         end
         return true
     end
-    if not copyPose() then model:Destroy(); return false,"Character changed during morph." end
+    if request~=MorphRequest or P.Character~=character or not copyPose() then model:Destroy(); return false,"Character changed during morph." end
 
     resetMorph()
     model.Name="SAE_MorphShell"
     MorphShell=model
+    MorphChoice=user
     MorphConn=RunService.RenderStepped:Connect(function()
         if MorphShell~=model or not model:IsDescendantOf(workspace) or P.Character~=character or not copyPose() then
             resetMorph()
@@ -5225,6 +5257,7 @@ morphBtn.MouseButton1Click:Connect(function()
     morphBtn.Text="MORPH"
 end)
 resetMorphBtn.MouseButton1Click:Connect(function()
+    MorphChoice=nil;MorphRequestChoice=nil;MorphRequest+=1
     resetMorph()
     selectOwnAvatar()
     morphStatus.Text="Original appearance restored."
@@ -5676,7 +5709,48 @@ UserInputService.InputBegan:Connect(function(input)
     if input.KeyCode==Enum.KeyCode.Tab then local now=os.clock(); if now-lastTab>.2 then lastTab=now; Console.Visible=not Console.Visible end; return end
     if input.KeyCode==Enum.KeyCode.X and HeldEgg and not UserInputService:GetFocusedTextBox() then dropHeld() end
 end)
-P.CharacterAdded:Connect(function() HeldEgg=nil; Carry.Visible=false; resetMorph(); task.wait(.5); applyTag() end)
+local MorphCharacterEpoch=0
+local MorphLifecycleConnections={}
+local function restoreMorphOnCharacter(character)
+    MorphCharacterEpoch+=1
+    local epoch=MorphCharacterEpoch
+    local request=MorphRequest
+    local choice=MorphChoice
+    HeldEgg=nil;Carry.Visible=false
+    resetMorph()
+    task.spawn(function()
+        local deadline=os.clock()+12
+        while Gui.Parent and epoch==MorphCharacterEpoch and P.Character==character and os.clock()<deadline do
+            local root=character:FindFirstChild('HumanoidRootPart')
+            local humanoid=character:FindFirstChildOfClass('Humanoid')
+            if root and humanoid and humanoid.Health>0 then break end
+            task.wait(.1)
+        end
+        if not Gui.Parent or epoch~=MorphCharacterEpoch or P.Character~=character then return end
+        local humanoid=character:FindFirstChildOfClass('Humanoid')
+        if not humanoid or humanoid.Health<=0 then return end
+        applyTag()
+        if choice and choice==MorphChoice and request==MorphRequest then
+            local ok,message=doMorph(choice,character)
+            if not ok then warn('[SAE] Morph restore: '..tostring(message)) end
+        end
+    end)
+end
+MorphLifecycleConnections[#MorphLifecycleConnections+1]=P.CharacterRemoving:Connect(function()
+    MorphCharacterEpoch+=1;MorphRequest+=1
+    resetMorph()
+end)
+MorphLifecycleConnections[#MorphLifecycleConnections+1]=P.CharacterAdded:Connect(restoreMorphOnCharacter)
+MorphLifecycleConnections[#MorphLifecycleConnections+1]=P.CharacterAppearanceLoaded:Connect(function(character)
+    if character==P.Character and MorphChoice and (not MorphRequestChoice or MorphRequestChoice==MorphChoice) then restoreMorphOnCharacter(character) end
+end)
+Gui.Destroying:Connect(function()
+    for _,connection in ipairs(MorphLifecycleConnections) do connection:Disconnect() end
+    MorphRequest+=1;MorphChoice=nil;resetMorph()
+    for _,template in pairs(MorphTemplates) do template:Destroy() end
+    MorphTemplates={}
+end)
+
 applyTag()
 
 -- ===== V7 TRUE 3D INVENTORY (inlined) =====
@@ -6945,6 +7019,7 @@ local function createTreadmillRuntime()
         local state=active
         if not state then return end
         active=nil cooldown=os.clock()+.6
+        if state.deathConnection then state.deathConnection:Disconnect() end
         if jump then dismounted=state.entry.model end
         if state.track then pcall(function() state.track:Stop(.18) end) end
         if state.headphones then state.headphones:Destroy() end
@@ -6971,13 +7046,14 @@ local function createTreadmillRuntime()
         local old=character:FindFirstChild('SAE_TREADMILL_HEADPHONES')
         if old then old:Destroy() end
         local model=Instance.new('Model') model.Name='SAE_TREADMILL_HEADPHONES'
-        model.Parent=character
+        model.Parent=workspace.CurrentCamera or workspace
         local function piece(name,size,col,cf,rounded,material)
             local p=part(model,name,size,col,head.CFrame*cf,material or MAT)
             if rounded then
                 local mesh=Instance.new('SpecialMesh') mesh.MeshType=Enum.MeshType.Sphere mesh.Parent=p
             end
-            local weld=Instance.new('WeldConstraint') weld.Part0=head weld.Part1=p weld.Parent=p
+            -- Render-only headphones: never attach another physical assembly to the live head.
+            p.Anchored=true;p.CanCollide=false;p.CanTouch=false;p.CanQuery=false
             return p
         end
         local rx=head.Size.X*.5+.22
@@ -6995,6 +7071,7 @@ local function createTreadmillRuntime()
             piece('HeadphoneAccent',Vector3.new(.08,.46,.43),color,CFrame.new(side*(rx+.28),-.06,0),true)
             piece('HeadphoneLight',Vector3.new(.035,.23,.09),color,CFrame.new(side*(rx+.33),-.06,.02),true,NEON)
         end
+        model.WorldPivot=head.CFrame
         return model
     end
 
@@ -7073,7 +7150,7 @@ local function createTreadmillRuntime()
     -- Pooled visual step gains. These never write to the game's stats.
     local function makeStepPopup()
         local gui=Instance.new('BillboardGui')
-        gui.Name='SAE_TREADMILL_STEP_POPUP' gui.Size=UDim2.fromOffset(188,66)
+        gui.Name='SAE_TREADMILL_STEP_POPUP' gui.ResetOnSpawn=false gui.Size=UDim2.fromOffset(188,66)
         gui.AlwaysOnTop=true gui.LightInfluence=0 gui.MaxDistance=85 gui.Enabled=false gui.Parent=PG
         local canvas=Instance.new('Frame')
         canvas.AnchorPoint=Vector2.new(.5,.5) canvas.Position=UDim2.fromScale(.5,.5)
@@ -7109,11 +7186,13 @@ local function createTreadmillRuntime()
     local function emitStep(state,now)
         if #popups<6 then popups[#popups+1]=makeStepPopup() end
         popupSerial+=1
-        local popup=popups[(popupSerial-1)%#popups+1]
+        local slot=(popupSerial-1)%#popups+1
+        local popup=popups[slot]
+        if not popup.gui.Parent then popup=makeStepPopup();popups[slot]=popup end
         local side=popupSerial%2==0 and 1 or -1
         popup.started=now popup.x=side*(.45+(popupSerial%3)*.33)
         popup.drift=side*.50 popup.y=.15+(popupSerial%3)*.22
-        popup.gui.Adornee=state.character:FindFirstChild('Head') or state.root
+        popup.gui.Adornee=(MorphShell and MorphShell:FindFirstChild('Head')) or state.character:FindFirstChild('Head') or state.root
         popup.number.TextColor3=state.entry.rewardColor
         popup.halo.ImageColor3=state.entry.rewardColor
         popup.icon.Image=E.SAE_STEP_ICON_ASSET or popup.icon.Image
@@ -7167,9 +7246,11 @@ local function createTreadmillRuntime()
         local scale=entry.model:GetAttribute('SAE_TREADMILL_MODEL_SCALE') or 1
         local leg=humanoid.RigType==Enum.HumanoidRigType.R6 and character:FindFirstChild('Left Leg')
         local standing=humanoid.HipHeight+root.Size.Y*.5+(leg and leg.Size.Y or 0)
+        if P.Character~=character or not entry.belt.Parent then return end
         local cf=entry.model:GetPivot()
-        local position=(cf*CFrame.new(0,.49*scale+standing,.40*scale)).Position
-        local toward=(cf*CFrame.new(0,.49*scale+standing,-3*scale)).Position
+        local position=(entry.belt.CFrame*CFrame.new(0,entry.belt.Size.Y*.5+standing+.08,.25*scale)).Position
+        if (root.Position-position).Magnitude>math.max(14,12*scale) then return end
+        local toward=position+Vector3.new(cf.LookVector.X,0,cf.LookVector.Z)
         local state={
             entry=entry,character=character,humanoid=humanoid,root=root,
             anchored=root.Anchored,speed=humanoid.WalkSpeed,rotate=humanoid.AutoRotate,
@@ -7185,16 +7266,23 @@ local function createTreadmillRuntime()
             end
         end
         active=state
+        local mounted,mountError=pcall(function()
         humanoid.WalkSpeed=0 humanoid.AutoRotate=false
         root.AssemblyLinearVelocity=Vector3.zero root.AssemblyAngularVelocity=Vector3.zero
-        root.CFrame=CFrame.lookAt(position,toward)
         root.Anchored=true
+        root.CFrame=CFrame.lookAt(position,toward)
         popupClock=0
+        state.deathConnection=humanoid.Died:Connect(function() if active==state then stopRunning(false) end end)
         state.headphones=headphones(character,entry.color)
         state.aura=runningAura(root,standing,entry.rewardColor)
         state.track=runTrack(character,humanoid)
         if active~=state then return end
         if state.track then pcall(function() state.track:Play(.18,1,1.35) end) end
+        end)
+        if not mounted then
+            if active==state then stopRunning(false) end
+            warn("[SAE] Treadmill mount cancelled safely: "..tostring(mountError))
+        end
     end
 
     local function touchingEntry(entry,character)
@@ -7375,7 +7463,11 @@ local function createTreadmillRuntime()
         end
     end
     connect(Run.PreSimulation,function()
-        if active then poseRunner(active,os.clock()) end
+        if active then
+            local head=(MorphShell and MorphShell:FindFirstChild("Head")) or active.character:FindFirstChild("Head")
+            if active.headphones and active.headphones.Parent and head then active.headphones:PivotTo(head.CFrame) end
+            poseRunner(active,os.clock())
+        end
     end)
     -- Isolated delivery previews share the normal treadmill's run track and fallback gait.
     function api:StartPreview(character,humanoid,machine,belt)
@@ -7556,6 +7648,12 @@ local function placeTreadmill(t,m)
     -- Preserve the held build itself, including scale, detail and light attachments.
     local placed=m:Clone()
     stabilizeTreadmillShapes(placed)
+    -- Held models may contain welds to the Tool handle. A placed clone must be isolated.
+    for _,joint in ipairs(placed:GetDescendants()) do
+        if joint:IsA('JointInstance') or joint:IsA('WeldConstraint') then
+            if (joint.Part0 and not joint.Part0:IsDescendantOf(placed)) or (joint.Part1 and not joint.Part1:IsDescendantOf(placed)) then joint:Destroy() end
+        end
+    end
     for _,p in ipairs(allParts(placed)) do
         p.Anchored=true
         p.CanCollide=false
@@ -7569,10 +7667,11 @@ local function placeTreadmill(t,m)
     placed:SetAttribute('SAE_PLACED_TREADMILL',true)
     placed.Parent=Placed
     treadmillRuntime:Watch(placed)
+    if E.SAE_INVENTORY_FORGET then E.SAE_INVENTORY_FORGET(t) end
     t:Destroy()
     return true
 end
-local function place(t,m)if m:GetAttribute('SAE_TREADMILL') then return placeTreadmill(t,m) end local c=m:Clone()for _,d in ipairs(c:GetDescendants())do if d:IsA('WeldConstraint')or d:IsA('Motor6D')then d:Destroy()end end c.Parent=Placed for _,p in ipairs(allParts(c))do p.Anchored=true p.CanCollide=false p.CanQuery=true end local mouse=P:GetMouse()local pos=mouse and mouse.Hit and mouse.Hit.Position local hrp=P.Character and P.Character:FindFirstChild('HumanoidRootPart')pos=pos or(hrp and(hrp.Position+hrp.CFrame.LookVector*9))or Vector3.zero local rp=RaycastParams.new()rp.FilterType=Enum.RaycastFilterType.Exclude rp.FilterDescendantsInstances={P.Character,Placed}local ray=workspace:Raycast(pos+Vector3.new(0,35,0),Vector3.new(0,-100,0),rp)if ray then pos=ray.Position end c:PivotTo(CFrame.new(pos))local cf,sz=c:GetBoundingBox()c:PivotTo(c:GetPivot()+Vector3.new(0,pos.Y-(cf.Position.Y-sz.Y/2)+.08,0))t:Destroy()end
+local function place(t,m)if m:GetAttribute('SAE_TREADMILL') then return placeTreadmill(t,m) end local c=m:Clone()for _,d in ipairs(c:GetDescendants())do if d:IsA('WeldConstraint')or d:IsA('Motor6D')then d:Destroy()end end c.Parent=Placed for _,p in ipairs(allParts(c))do p.Anchored=true p.CanCollide=false p.CanQuery=true end local mouse=P:GetMouse()local pos=mouse and mouse.Hit and mouse.Hit.Position local hrp=P.Character and P.Character:FindFirstChild('HumanoidRootPart')pos=pos or(hrp and(hrp.Position+hrp.CFrame.LookVector*9))or Vector3.zero local rp=RaycastParams.new()rp.FilterType=Enum.RaycastFilterType.Exclude rp.FilterDescendantsInstances={P.Character,Placed}local ray=workspace:Raycast(pos+Vector3.new(0,35,0),Vector3.new(0,-100,0),rp)if ray then pos=ray.Position end c:PivotTo(CFrame.new(pos))local cf,sz=c:GetBoundingBox()c:PivotTo(c:GetPivot()+Vector3.new(0,pos.Y-(cf.Position.Y-sz.Y/2)+.08,0))if E.SAE_INVENTORY_FORGET then E.SAE_INVENTORY_FORGET(t) end t:Destroy()end
 local iconCache={}
 local function imageContent(value)
     if type(value)~='string' then return nil end
@@ -7768,13 +7867,106 @@ local function showInventoryToast(name)
     end)
 end
 
-local function spawnTool(cat,name)local image=itemImage(cat,name) if not image then return false,'Exact item image is not ready'end local m,exact=model(cat,name)if not m then return false,'No 3D model available'end local t=Instance.new('Tool')t.Name=name t.TextureId=image t:SetAttribute('SAE_EXACT_REFERENCE_ICON',image) t.RequiresHandle=true t.CanBeDropped=false t:SetAttribute('SAE_V7_TOOL',true)t:SetAttribute('SAE_ID',Http:GenerateGUID(false))local h=part(t,'Handle',Vector3.new(.45,.45,.45),Color3.new(),CFrame.new(),MAT,1)h.CanQuery=false if m:GetAttribute('SAE_TREADMILL') then
+-- Tool recipes survive character death; all new tools use the current Backpack.
+local spawnTool
+local SavedInventory={}
+local InventoryEpoch=0
+local InventoryRestoring=false
+local InventoryPending=false
+local InventoryAlive=true
+local InventoryRespawning=false
+local function currentBackpack()
+    local bag=P:FindFirstChildOfClass('Backpack')
+    if bag and bag.Parent==P then BP=bag;return bag end
+    BP=nil
+    return nil
+end
+local function findSavedTool(id)
+    local holders={}
+    local bag=currentBackpack()
+    if bag then holders[#holders+1]=bag end
+    if P.Character then holders[#holders+1]=P.Character end
+    for _,holder in ipairs(holders) do
+        for _,tool in ipairs(holder:GetChildren()) do
+            if tool:IsA('Tool') and tool:GetAttribute('SAE_ID')==id then return tool end
+        end
+    end
+end
+local function forgetInventoryTool(tool)
+    local id=tool and tool:GetAttribute('SAE_ID')
+    if id then SavedInventory[id]=nil end
+end
+E.SAE_INVENTORY_FORGET=forgetInventoryTool
+local function inventoryCharacterReady()
+    local character=P.Character
+    local humanoid=character and character:FindFirstChildOfClass('Humanoid')
+    return not InventoryRespawning and character and character.Parent and humanoid and humanoid.Health>0
+        and character:FindFirstChild('HumanoidRootPart') and currentBackpack()
+end
+local function requestInventoryRestore()
+    if not InventoryAlive then return end
+    InventoryPending=true
+    if InventoryRestoring then return end
+    InventoryRestoring=true
+    task.spawn(function()
+        local retryEpoch,retries=-1,0
+        while InventoryAlive and InventoryPending do
+            InventoryPending=false
+            local epoch=InventoryEpoch
+            if retryEpoch~=epoch then retryEpoch=epoch;retries=0 end
+            local deadline=os.clock()+15
+            while InventoryAlive and epoch==InventoryEpoch and not inventoryCharacterReady() and os.clock()<deadline do task.wait(.1) end
+            if epoch~=InventoryEpoch then InventoryPending=true
+            elseif InventoryAlive and inventoryCharacterReady() then
+                local failed=false
+                local recipes={}
+                for id,recipe in pairs(SavedInventory) do recipes[#recipes+1]={id=id,category=recipe.category,name=recipe.name} end
+                for _,recipe in ipairs(recipes) do
+                    if not InventoryAlive then break end
+                    if epoch~=InventoryEpoch then InventoryPending=true;break end
+                    if SavedInventory[recipe.id] and not findSavedTool(recipe.id) then
+                        local ok,made,message=pcall(spawnTool,recipe.category,recipe.name,recipe.id,true)
+                        if not ok or not made then failed=true;warn('[SAE] Inventory restore '..recipe.name..': '..tostring(ok and message or made)) end
+                    end
+                end
+                if failed and InventoryAlive and epoch==InventoryEpoch then
+                    retries+=1
+                    if retries<3 then task.wait(.5);InventoryPending=true end
+                end
+            end
+        end
+        InventoryRestoring=false
+    end)
+end
+local inventoryConnections={}
+inventoryConnections[#inventoryConnections+1]=P.ChildAdded:Connect(function(child)
+    if child:IsA('Backpack') then BP=child;InventoryEpoch+=1;requestInventoryRestore() end
+end)
+inventoryConnections[#inventoryConnections+1]=P.ChildRemoved:Connect(function(child)
+    if child==BP then BP=nil;InventoryEpoch+=1 end
+end)
+inventoryConnections[#inventoryConnections+1]=P.CharacterRemoving:Connect(function()
+    InventoryRespawning=true;InventoryEpoch+=1
+end)
+inventoryConnections[#inventoryConnections+1]=P.CharacterAdded:Connect(function()
+    InventoryRespawning=false;InventoryEpoch+=1;requestInventoryRestore()
+end)
+Gui.Destroying:Connect(function()
+    InventoryAlive=false
+    for _,connection in ipairs(inventoryConnections) do connection:Disconnect() end
+    if E.SAE_INVENTORY_FORGET==forgetInventoryTool then E.SAE_INVENTORY_FORGET=nil end
+end)
+
+spawnTool=function(cat,name,restoreId,silent)
+if not inventoryCharacterReady() then return false,"Character is respawning. Try again when it is ready." end
+if restoreId and findSavedTool(restoreId) then return true,"Already restored" end
+local image=itemImage(cat,name) if not image then return false,'Exact item image is not ready'end local m,exact=model(cat,name)if not m then return false,'No 3D model available'end local t=Instance.new('Tool')t.Name=name t.TextureId=image t:SetAttribute('SAE_EXACT_REFERENCE_ICON',image) t.RequiresHandle=true t.CanBeDropped=false t:SetAttribute('SAE_V7_TOOL',true)t:SetAttribute('SAE_ID',restoreId or Http:GenerateGUID(false))t:SetAttribute('SAE_INVENTORY_CATEGORY',cat)t:SetAttribute('SAE_INVENTORY_NAME',name)local h=part(t,'Handle',Vector3.new(.45,.45,.45),Color3.new(),CFrame.new(),MAT,1)h.CanQuery=false if m:GetAttribute('SAE_TREADMILL') then
     t.ToolTip='Equip and click a flat floor to place this treadmill.'
     t.Grip=CFrame.new(0,-.5,0)
     weld(t,m,CFrame.new(0,-1.2,-7.2))
     treadmillRuntime:Watch(m)
     t.Activated:Connect(function() if t.Parent==P.Character then place(t,m) end end)
-elseif cat=='Eggs'then t.Grip=CFrame.new(0,-.1,-.25)*CFrame.Angles(math.rad(-12),math.rad(180),0)weld(t,m,CFrame.new(0,.45,-.75)*CFrame.Angles(0,math.rad(180),0))elseif cat=='Star'then t.Grip=CFrame.new(0,0,0)*CFrame.Angles(0,math.rad(180),0)weld(t,m,CFrame.new(0,.5,-1.55)*CFrame.Angles(0,math.rad(180),0))else weld(t,m,CFrame.new(0,2,-4.4))t.Activated:Connect(function()if t.Parent==P.Character then place(t,m)end end)end t.Parent=BP showInventoryToast(name) return true,(m:GetAttribute('SAE_TREADMILL') and 'Custom 3D treadmill') or (cat=='Eggs' and '3D reference model') or (exact and 'Exact loaded 3D model' or 'True 3D reference build')end
+elseif cat=='Eggs'then t.Grip=CFrame.new(0,-.1,-.25)*CFrame.Angles(math.rad(-12),math.rad(180),0)weld(t,m,CFrame.new(0,.45,-.75)*CFrame.Angles(0,math.rad(180),0))elseif cat=='Star'then t.Grip=CFrame.new(0,0,0)*CFrame.Angles(0,math.rad(180),0)weld(t,m,CFrame.new(0,.5,-1.55)*CFrame.Angles(0,math.rad(180),0))else weld(t,m,CFrame.new(0,2,-4.4))t.Activated:Connect(function()if t.Parent==P.Character then place(t,m)end end)end local bag=currentBackpack() if not bag or not inventoryCharacterReady() then t:Destroy();return false,"Character is respawning. Try again shortly." end t.Parent=bag SavedInventory[t:GetAttribute("SAE_ID")]={category=cat,name=name} if not silent then showInventoryToast(name) end return true,(m:GetAttribute('SAE_TREADMILL') and 'Custom 3D treadmill') or (cat=='Eggs' and '3D reference model') or (exact and 'Exact loaded 3D model' or 'True 3D reference build')end
 
 local C={bg=rgb(8,8,14),head=rgb(15,11,23),card=rgb(24,18,34),card2=rgb(37,25,50),border=rgb(84,57,110),p=rgb(142,51,236),p2=rgb(184,83,255),w=Color3.new(1,1,1),m=rgb(168,162,181),g=rgb(105,245,135),o=rgb(255,188,82),r=rgb(255,90,90)}
 local function corner(o,r)local x=Instance.new('UICorner')x.CornerRadius=UDim.new(0,r or 8)x.Parent=o end
@@ -8370,6 +8562,9 @@ playerGui.ChildAdded:Connect(function(child)
     end
 end)
 
+player.ChildAdded:Connect(function(child)
+    if child:IsA('Backpack') then backpack=child;bindContainer(child) end
+end)
 bindContainer(backpack)
 bindContainer(player.Character)
 player.CharacterAdded:Connect(function(char)
@@ -8518,6 +8713,9 @@ local function bind(container)
     end
 end
 
+P.ChildAdded:Connect(function(child)
+    if child:IsA('Backpack') then BP=child;bind(child) end
+end)
 bind(BP)
 bind(P.Character)
 P.CharacterAdded:Connect(function(char)
